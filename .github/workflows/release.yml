@@ -17,6 +17,9 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  THEOS: /opt/theos
+
 jobs:
   package:
     name: package ${{ matrix.flavor }}
