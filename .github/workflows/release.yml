@@ -1,0 +1,96 @@
+name: release
+
+# Build all lanes, collect the .debs, regenerate the apt index, and push it to
+# the erv5/repo GitHub Pages repo (served at https://repo.soardev.cc).
+#
+# Triggered by pushing a version tag (e.g. `git tag v4.0.0 && git push --tags`),
+# or manually via workflow_dispatch. Requires a REPO_PUSH_TOKEN secret: a
+# fine-grained PAT (or deploy key) with contents:write on erv5/repo.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: package ${{ matrix.flavor }}
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lanes whose debs we publish. rootful-legacy builds on Ubuntu; keep it
+        # out of this macOS matrix and let the existing build.yml cover it.
+        flavor: [rootful-modern, rootless, roothide]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Theos
+        run: |
+          brew install dpkg ldid
+          sudo git clone --recursive --quiet https://github.com/jjolano/theos.git "$THEOS"
+          curl -fL -o "$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz" \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+          echo '5e0fd3f01266cce4ce012d4a99b38eb56578fca40d09edc81cd83dee958202fb  '"$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz" | shasum -a 256 -c -
+          sudo mkdir -p "$THEOS/sdks"
+          sudo tar -xJf "$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
+          curl -fL -o "$RUNNER_TEMP/iPhoneOS14.5.sdk.tar.xz" \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS14.5.sdk.tar.xz
+          echo '1c998a5ee7eb8c29e39f0d8c83add9cad1a954342ca0d86204d1b4fe08a921b9  '"$RUNNER_TEMP/iPhoneOS14.5.sdk.tar.xz" | shasum -a 256 -c -
+          sudo tar -xJf "$RUNNER_TEMP/iPhoneOS14.5.sdk.tar.xz" -C "$THEOS/sdks"
+          sudo chown -R "$(id -un)" "$THEOS"
+
+      - name: Build
+        env:
+          SHADOW_HOOKKIT_ABI_STRICT: 1
+        run: |
+          .github/scripts/install-hookkit-theos.sh "${{ matrix.flavor }}"
+          .github/scripts/build-deps.sh "${{ matrix.flavor }}"
+          ./build.sh "${{ matrix.flavor }}"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: shadow-${{ matrix.flavor }}
+          path: build/*.deb
+
+  publish:
+    name: publish to erv5/repo
+    needs: package
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download lane debs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: shadow-*
+          path: release-debs
+          merge-multiple: true
+
+      - name: Check out erv5/repo
+        uses: actions/checkout@v5
+        with:
+          repository: erv5/repo
+          token: ${{ secrets.REPO_PUSH_TOKEN }}
+          path: erv5-repo
+
+      - name: Regenerate apt index
+        run: .github/scripts/publish-repo.sh erv5-repo release-debs
+
+      - name: Commit and push repo index
+        working-directory: erv5-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "repo index unchanged; nothing to push"
+            exit 0
+          fi
+          git commit -m "publish: ${{ github.ref_name }} (${{ github.sha }})"
+          git push
