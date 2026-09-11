@@ -18,7 +18,10 @@ mkdir -p "$REPO_DIR/debs"
 # first occurrence; keep only the latest version of each package id).
 cp -f "$DEBS_DIR"/*.deb "$REPO_DIR/debs/" 2>/dev/null || true
 
-# Prune to latest version per package id so the index does not grow stale rows.
+# Prune to latest version per (package id, architecture). The same package at
+# the same version ships as separate debs per lane (rootless=iphoneos-arm64,
+# roothide=iphoneos-arm64e); those are distinct and must coexist, so the key
+# includes Architecture, not just Package.
 python3 - "$REPO_DIR/debs" <<'PY'
 import os, re, subprocess, sys
 debs = sys.argv[1]
@@ -29,15 +32,19 @@ for f in os.listdir(debs):
     if not f.endswith('.deb'): continue
     p = os.path.join(debs, f)
     try:
-        out = subprocess.check_output(['dpkg-deb','-f',p,'Package','Version']).decode().splitlines()
-        pkg = dict(zip(out[0::2], out[1::2])) if False else None
+        raw = subprocess.check_output(
+            ['dpkg-deb','-f',p,'Package','Version','Architecture']).decode().splitlines()
     except Exception:
         continue
-    # dpkg-deb -f with multiple fields prints one per line in order
-    pkgid, ver = out[0], out[1]
-    cur = latest.get(pkgid)
+    # dpkg-deb -f prints bare values on some builds, "Field: value" on others;
+    # strip any "Field: " label so the key is just (pkgid, arch) either way.
+    vals = [l.split(': ',1)[1] if ': ' in l else l for l in raw]
+    if len(vals) < 3: continue
+    pkgid, ver, arch = vals[0].strip(), vals[1].strip(), vals[2].strip()
+    key = (pkgid, arch)
+    cur = latest.get(key)
     if cur is None or ver_key(ver) > ver_key(cur[0]):
-        latest[pkgid] = (ver, p)
+        latest[key] = (ver, p)
 keep = {v[1] for v in latest.values()}
 for f in os.listdir(debs):
     p = os.path.join(debs, f)
