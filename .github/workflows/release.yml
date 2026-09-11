@@ -70,6 +70,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install dpkg (dpkg-scanpackages for the apt index)
+        run: brew install dpkg
+
       - name: Download lane debs
         uses: actions/download-artifact@v7
         with:
