@@ -72,7 +72,7 @@ Codename: soardev
 Date: $DATE
 Architectures: iphoneos-arm64 iphoneos-arm64e
 Components: main
-Description: soardev.cc — Shadow fork and related jailbreak packages
+Description: soardev.cc — Shadow fork (beta) by erv5, based on jjolano/shadow
 MD5Sum:
 EOF
 ( cd "$REPO_DIR" && for f in Packages Packages.gz Packages.bz2; do
