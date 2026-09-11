@@ -185,7 +185,20 @@ static BOOL SHDWPluginEnabled(const SHDWPlugin* plugin,
     if(event == SHDWEventDetectorEscalation && plugin->phase == SHDWPhaseEscalation) {
         return YES;
     }
-    return [prefs[plugin->prefKey] boolValue];
+    id value = prefs[plugin->prefKey];
+    if(value == nil) {
+        // Absent key must not silently disable a default-on plugin. The per-app
+        // plist only carries keys the user actually toggled; an unset
+        // Universal_Memory (etc.) would otherwise read as NO via [nil boolValue]
+        // and never install — e.g. the vm_read_overwrite prologue-restore hook
+        // would stay off and inline-patch integrity checks (BShield) still fire.
+        // Fall back to the built-in default for that plugin.
+        value = [SHDWDefaultHookSettings() objectForKey:plugin->prefKey];
+        if(value == nil) {
+            return YES; // no declared default: treat as enabled (matches prefKey==NULL)
+        }
+    }
+    return [value boolValue];
 }
 
 static BOOL SHDWPluginCapable(const SHDWPlugin* plugin, SHDWCapabilities caps) {
