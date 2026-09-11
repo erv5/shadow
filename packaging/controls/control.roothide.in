@@ -10,8 +10,8 @@ Conflicts: me.jjolano.shadow.beta, me.jjolano.shadow.legacy
 Version: 4.0.0~beta.1
 Architecture: @PACKAGE_ARCH@
 Description: A modern jailbreak detection bypass for RootHide. (Beta)
- Fork maintained by erv5 — per-app hook toggles, detector fixes.
- Based on jjolano/shadow 4.0.0.
+ Fork maintained by erv5: per-app hook toggles, detector fixes.
+ Based on jjolano/shadow master (unreleased 4.0.0 line).
 Maintainer: erv5
 Author: jjolano
 Section: System
