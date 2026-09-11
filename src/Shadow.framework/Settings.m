@@ -134,6 +134,32 @@ static NSString* const kSHDWDetectorRunnerOverridesKey = @"Test_DetectorOverride
     result[SHDWDetectorAggressiveID] = @(SHDWDetectorAggressiveEnabled(
         app_settings, [userDefaults boolForKey:SHDWDetectorAggressiveID]));
 
+    // Per-app per-plugin hook toggles: forward any Universal_*/Adapter_* key the
+    // user set for this app over the global default (root scalar) or built-in
+    // default. The planner gates each plugin on prefs[prefKey]; without this
+    // merge the per-app path only ever carried Enabled/Aggressive and the
+    // toggles were inert. Only keys that are real plugin prefKeys are forwarded
+    // so unrelated per-app keys (HK_Library, etc.) are ignored.
+    static NSArray<NSString*>* toggleKeys = nil;
+    static dispatch_once_t toggleKeysOnce;
+    dispatch_once(&toggleKeysOnce, ^{
+        NSUInteger pluginCount = 0;
+        const SHDWPlugin* plugins = SHDWPluginRegistry(&pluginCount);
+        NSMutableArray<NSString*>* keys = [NSMutableArray new];
+        for(NSUInteger i = 0; i < pluginCount; i++) {
+            if(plugins[i].prefKey) {
+                [keys addObject:plugins[i].prefKey];
+            }
+        }
+        toggleKeys = [keys copy];
+    });
+    for(NSString* key in toggleKeys) {
+        id value = app_settings[key];
+        if([value isKindOfClass:[NSNumber class]]) {
+            result[key] = @([value boolValue]);
+        }
+    }
+
     if(enabled) {
         // Not user configuration: the device evidence driver can disable one
         // adapter for the harness's embedded detectors without weakening

@@ -40,8 +40,13 @@ static const SHDWPlugin kSHDWPlugins[] = {
     // Generic detector integrity: reveal pre-Shadow IMPs and protect only
     // import slots Shadow actually rebound. Installed on detector evidence.
     { "Universal_DetectorIntegrity",   NULL,                                  SHDWPhaseTier2,       SHDWCapabilityFunction,    0, 0 },
-    // Tier-2: ObjC-method swizzles install on first detector evidence.
-    { "Universal_Filesystem_ObjC",     SHDWUniversalFilesystemID,             SHDWPhaseTier2,       SHDWCapabilityMessage,     0, 0 },
+    // ObjC-method swizzles. NSFileManager's fileExistsAtPath is a primary
+    // jailbreak-file probe (a Code-5-class filesystem check); installing it
+    // lazily on detector evidence is a RACE the app sometimes wins, leaking the
+    // artifact. Install the filesystem ObjC tier eagerly (Tier-1, at ctor) so
+    // the path checks are hidden before the app's first probe. Trampoline cost
+    // is modest (~25 hooks) now that the Foundation cluster stays Tier-2.
+    { "Universal_Filesystem_ObjC",     SHDWUniversalFilesystemID,             SHDWPhaseTier1,       SHDWCapabilityMessage,     1, 1 },
     { "Universal_Foundation_ObjC",     SHDWUniversalFoundationID,             SHDWPhaseTier2,       SHDWCapabilityMessage,     0, 0 },
     { "Universal_HideApps",            SHDWUniversalHideAppsID,               SHDWPhaseTier2,       SHDWCapabilityMessage,     0, 0 },
     // UIKit-load groups (the classes only exist once UIKit is loaded).

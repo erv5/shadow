@@ -83,6 +83,11 @@
 		return @(SHDWAppAggressive(prefs, [self applicationID]));
 	}
 
+	// Per-app hook toggles: identifier is the plugin prefKey (Universal_*/Adapter_*).
+	if([key hasPrefix:@"Universal_"] || [key hasPrefix:@"Adapter_"]) {
+		return @(SHDWAppHookToggled(prefs, [self applicationID], key));
+	}
+
 	return nil;
 }
 
@@ -123,6 +128,13 @@
 
 	if([key isEqualToString:@"Detector_Aggressive"]) {
 		SHDWWriteAppAggressive(prefs, [self applicationID], [value boolValue]);
+		return;
+	}
+
+	// Per-app hook toggles: identifier is the plugin prefKey (Universal_*/Adapter_*).
+	if([key hasPrefix:@"Universal_"] || [key hasPrefix:@"Adapter_"]) {
+		SHDWWriteAppHookToggled(prefs, [self applicationID], key, [value boolValue]);
+		return;
 	}
 }
 

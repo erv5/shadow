@@ -61,11 +61,34 @@ BOOL SHDWAppFollowsGlobal(NSUserDefaults *prefs, NSString *appID) {
 	return !SHDWAppIsCustomized([prefs dictionaryForKey:appID]);
 }
 
+// Every plugin prefKey (Universal_*/Adapter_*) — the per-app toggle surface.
+static NSArray<NSString*>* SHDWHookTogglePrefKeys(void) {
+	static NSArray<NSString*>* keys = nil;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		NSUInteger count = 0;
+		const SHDWPlugin* plugins = SHDWPluginRegistry(&count);
+		NSMutableArray<NSString*>* list = [NSMutableArray new];
+		for(NSUInteger i = 0; i < count; i++) {
+			if(plugins[i].prefKey) [list addObject:plugins[i].prefKey];
+		}
+		keys = [list copy];
+	});
+	return keys;
+}
+
 BOOL SHDWAppIsCustomized(id appPrefs) {
-	return [appPrefs isKindOfClass:[NSDictionary class]] &&
-		([appPrefs objectForKey:SHDWAppEnabledID] != nil ||
-		 [appPrefs objectForKey:SHDWAppDisabledID] != nil ||
-		 [appPrefs objectForKey:SHDWDetectorAggressiveID] != nil);
+	if(![appPrefs isKindOfClass:[NSDictionary class]]) return NO;
+	if([appPrefs objectForKey:SHDWAppEnabledID] != nil ||
+	   [appPrefs objectForKey:SHDWAppDisabledID] != nil ||
+	   [appPrefs objectForKey:SHDWDetectorAggressiveID] != nil) {
+		return YES;
+	}
+	// A per-app hook toggle also makes the app customized (stops Follow Global).
+	for(NSString* key in SHDWHookTogglePrefKeys()) {
+		if([appPrefs objectForKey:key] != nil) return YES;
+	}
+	return NO;
 }
 
 BOOL SHDWResetApp(NSUserDefaults *prefs, NSString *appID) {
@@ -106,6 +129,29 @@ BOOL SHDWAppAggressive(NSUserDefaults *prefs, NSString *appID) {
 void SHDWWriteAppAggressive(NSUserDefaults *prefs, NSString *appID, BOOL aggressive) {
 	NSMutableDictionary* appPrefs = [[prefs dictionaryForKey:appID] mutableCopy] ?: [NSMutableDictionary new];
 	appPrefs[SHDWDetectorAggressiveID] = @(aggressive);
+	[prefs setObject:[appPrefs copy] forKey:appID];
+}
+
+BOOL SHDWAppHookToggled(NSUserDefaults *prefs, NSString *appID, NSString *prefKey) {
+	NSDictionary* appPrefs = [prefs dictionaryForKey:appID];
+	id value = [appPrefs objectForKey:prefKey];
+	if([value isKindOfClass:[NSNumber class]]) {
+		return [value boolValue];
+	}
+	// Per-app unset: fall back to the global scalar of the same key, then the
+	// built-in default. Mirrors Settings.m's merge order so the switch reflects
+	// what the planner will actually apply.
+	id global = [prefs objectForKey:prefKey];
+	if([global isKindOfClass:[NSNumber class]]) {
+		return [global boolValue];
+	}
+	id def = [SHDWDefaultHookSettings() objectForKey:prefKey];
+	return def ? [def boolValue] : YES;
+}
+
+void SHDWWriteAppHookToggled(NSUserDefaults *prefs, NSString *appID, NSString *prefKey, BOOL enabled) {
+	NSMutableDictionary* appPrefs = [[prefs dictionaryForKey:appID] mutableCopy] ?: [NSMutableDictionary new];
+	appPrefs[prefKey] = @(enabled);
 	[prefs setObject:[appPrefs copy] forKey:appID];
 }
 

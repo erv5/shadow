@@ -1,5 +1,7 @@
 #import "UniversalHooks.h"
 
+#import "../../SHDWPrologueRegistry.h"
+
 #ifndef VM_MAP_READ_NULL
 typedef vm_map_t vm_map_read_t;
 #endif
@@ -151,6 +153,30 @@ static kern_return_t replaced_mach_vm_region_recurse(vm_map_read_t target_task, 
     }
 }
 
+// vm_read_overwrite: the inline-patch integrity probe. Tamper detectors
+// (BShield) read a hooked function's live bytes back out of the task and
+// compare them to the expected prologue; ElleKit's inline lane left a branch
+// stub at the function entry, so the comparison flags the hook. The original
+// bytes are recoverable only because ShadowCore snapshots each prologue before
+// patching (SHDWPrologueRecord). Run the real read, then for any subrange that
+// overlaps a patched function, rewrite the caller's buffer with the pristine
+// snapshot so the read returns stock bytes. Only external callers are filtered;
+// Shadow's own reads (and cross-task reads) pass through with the live bytes.
+static kern_return_t (*original_vm_read_overwrite)(vm_map_t target_task, vm_address_t address, vm_size_t size, vm_address_t data, vm_size_t* outsize);
+static kern_return_t replaced_vm_read_overwrite(vm_map_t target_task, vm_address_t address, vm_size_t size, vm_address_t data, vm_size_t* outsize) {
+    kern_return_t result = original_vm_read_overwrite(target_task, address, size, data, outsize);
+
+    if(result != KERN_SUCCESS || !isCallerExternal() ||
+       target_task != mach_task_self() || !data || size == 0) {
+        return result;
+    }
+
+    // Rewrite any patched-function subranges in the freshly-read buffer with
+    // their pristine prologue bytes.
+    SHDWPrologueOverwrite(address, size, (uint8_t*)data);
+    return result;
+}
+
 static void shdw_install_memory_hook(SHDWHookSession* hooks, void* target,
                                      void* replacement, void** original,
                                      NSString* symbol) {
@@ -175,6 +201,8 @@ void shdw_universal_memory(SHDWHookSession* hooks) {
                              (void **) &original_mach_vm_region, @"mach_vm_region");
     shdw_install_memory_hook(hooks, mach_vm_region_recurse, replaced_mach_vm_region_recurse,
                              (void **) &original_mach_vm_region_recurse, @"mach_vm_region_recurse");
+    shdw_install_memory_hook(hooks, vm_read_overwrite, replaced_vm_read_overwrite,
+                             (void **) &original_vm_read_overwrite, @"vm_read_overwrite");
 }
 
 // Symbol policy for the mem C-function group (see dyld.x's
@@ -192,6 +220,7 @@ static const shdw_mem_sym_policy_entry_t shdw_mem_sym_policy_table[] = {
     { "mach_vm_region_recurse", (void*)&replaced_mach_vm_region_recurse, (void* const*)&original_mach_vm_region_recurse },
     { "vm_region_64", (void*)&replaced_vm_region_64, (void* const*)&original_vm_region_64 },
     { "vm_region_recurse_64", (void*)&replaced_vm_region_recurse_64, (void* const*)&original_vm_region_recurse_64 },
+    { "vm_read_overwrite", (void*)&replaced_vm_read_overwrite, (void* const*)&original_vm_read_overwrite },
 };
 
 void* shdw_sym_policy_lookup_mem(const char* name) {

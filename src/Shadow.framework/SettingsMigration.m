@@ -23,13 +23,22 @@ NSDictionary<NSString*, id>* SHDWMigratedHookSettings(NSDictionary<NSString*, id
     static NSSet* liveScalarKeys = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        liveScalarKeys = [NSSet setWithArray:@[
+        NSMutableSet* keys = [NSMutableSet setWithArray:@[
             SHDWGlobalEnabledID, SHDWSingleToggleMigrationID,
             SHDWAppEnabledID, SHDWUniversalHarnessBaselineID,
             // Live at both scopes: the global default (root scalar) and the
             // per-app override (same key inside an app dict).
             SHDWDetectorAggressiveID,
         ]];
+        // Per-plugin hook toggles are live again (per-app override surface). The
+        // planner gates each plugin on prefs[prefKey], so these keys must survive
+        // migration instead of being pruned as phantom switches.
+        NSUInteger pluginCount = 0;
+        const SHDWPlugin* plugins = SHDWPluginRegistry(&pluginCount);
+        for(NSUInteger i = 0; i < pluginCount; i++) {
+            if(plugins[i].prefKey) [keys addObject:plugins[i].prefKey];
+        }
+        liveScalarKeys = [keys copy];
     });
 
     for(NSString* key in [migrated allKeys]) {

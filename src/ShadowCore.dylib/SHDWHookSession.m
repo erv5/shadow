@@ -1,4 +1,5 @@
 #import "SHDWHookSession.h"
+#import "SHDWPrologueRegistry.h"
 #import <HookKit/HookKitResults.h>
 #import "hooks/Universal/rebind_slots.h"
 
@@ -565,6 +566,10 @@ static void shdw_init_spec(hk_hook_spec_t* spec, const char* stableID,
     spec.target.address.struct_size = sizeof(spec.target.address);
     spec.target.address.struct_version = HK_ABI_VERSION_3_0;
     spec.target.address.address = (uintptr_t)function;
+    // Snapshot the pristine prologue before the inline patch overwrites it, so
+    // the vm_read_overwrite hook can answer tamper-integrity reads (BShield) with
+    // the pre-patch bytes for any range overlapping this function.
+    SHDWPrologueRecord(function);
     BOOL installed = shdw_apply_hook_spec(&spec, oldPtr);
 
     // dladdr remap: a detector that resolves a hooked C function (via

@@ -18,3 +18,20 @@
 "AGGRESSIVE" = "Aggressive Mode";
 "APP_AGGRESSIVE_DESC" = "Natural bypass presents a stock-looking environment; aggressive mode also forces known detectors' checks to report clean for this app.";
 
+"HOOK_TOGGLES" = "Hook Toggles";
+"APP_HOOKS_DESC" = "Advanced: enable or disable individual hook categories for this app. Defaults follow the global profile. Disabling a category may let that detection method through; enabling crash-prone categories may destabilize the app.";
+"HOOK_FILESYSTEM" = "File System";
+"HOOK_DYNLIB" = "Dynamic Libraries";
+"HOOK_ENVVARS" = "Environment Variables";
+"HOOK_FOUNDATION" = "Foundation Framework";
+"HOOK_MACHBOOTSTRAP" = "Mach Service Lookups";
+"HOOK_IOKIT" = "IOKit";
+"HOOK_LOWLEVELC" = "Low-Level File Handles";
+"HOOK_ANTIDEBUG" = "Anti-Debugging Methods";
+"HOOK_CODESIGNING" = "Code Signing";
+"HOOK_SYSCALL" = "Private Syscalls";
+"HOOK_MEMORY" = "Memory";
+"HOOK_SANDBOX" = "App Sandbox";
+"HOOK_HIDEAPPS" = "App Enumeration";
+"HOOK_URLSCHEME" = "URL Handlers";
+
