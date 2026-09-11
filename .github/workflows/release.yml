@@ -19,6 +19,8 @@ concurrency:
 
 env:
   THEOS: /opt/theos
+  # HookKit pin — must match .github/workflows/build.yml (single source of truth).
+  HOOKKIT: af17d64def73be78f46f55c82592726ee4afeb74
 
 jobs:
   package:
