@@ -24,9 +24,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Lanes whose debs we publish. rootful-legacy builds on Ubuntu; keep it
-        # out of this macOS matrix and let the existing build.yml cover it.
-        flavor: [rootful-modern, rootless, roothide]
+        # Lanes whose debs we publish: rootless (Dopamine) + roothide. Rootful
+        # lanes are intentionally excluded for now.
+        flavor: [rootless, roothide]
     steps:
       - uses: actions/checkout@v5
 
