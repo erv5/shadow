@@ -64,7 +64,7 @@ fi
 # Release file: fixed metadata + fresh checksums for the index files.
 DATE="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')"
 cat > "$REPO_DIR/Release" <<EOF
-Origin: soardev
+Origin: soardev repo
 Label: soardev repo
 Suite: stable
 Version: 1.0
@@ -72,7 +72,7 @@ Codename: soardev
 Date: $DATE
 Architectures: iphoneos-arm64 iphoneos-arm64e
 Components: main
-Description: soardev.cc — Shadow fork (beta) by erv5, based on jjolano/shadow
+Description: soardev repo — Shadow fork (beta) by erv5, based on jjolano/shadow
 MD5Sum:
 EOF
 ( cd "$REPO_DIR" && for f in Packages Packages.gz Packages.bz2; do

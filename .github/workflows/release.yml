@@ -80,6 +80,15 @@ jobs:
           path: release-debs
           merge-multiple: true
 
+      # Only publish Shadow itself. build-deps also produces the opa334
+      # dependency debs (com.opa334.altlist, com.opa334.libsandy) into the same
+      # build/ dir; those belong to opa334's repo, not ours — users add his repo
+      # for the deps. Keep only me.jjolano.shadow debs here.
+      - name: Keep only Shadow debs (drop opa334 deps)
+        run: |
+          find release-debs -name '*.deb' ! -name 'me.jjolano.shadow_*' -delete
+          echo "publishing:"; ls -1 release-debs/*.deb
+
       - name: Check out erv5/repo
         uses: actions/checkout@v5
         with:
