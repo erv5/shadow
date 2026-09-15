@@ -771,7 +771,12 @@ static size_t shdw_svc_queue_count = 0;
 static _Atomic BOOL shdw_svc_drain_pending = NO;
 static _Atomic uint64_t shdw_svc_drain_deadline = 0;   // monotonic ns, trailing debounce
 
-#define SHDW_SVC_DRAIN_QUIET_NS (400ull * NSEC_PER_MSEC)
+#define SHDW_SVC_DRAIN_QUIET_NS (50ull * NSEC_PER_MSEC)
+// Batch cap: drain immediately once this many images wait. A long launch storm
+// (continuous dlopens for tens of seconds) otherwise starves the trailing
+// debounce — its quiet window never opens, detector svc sites sit unpatched,
+// and a raw-svc probe during the storm sees the real filesystem (detection).
+#define SHDW_SVC_DRAIN_BATCH 64
 
 static void shdw_svc_patch_header(const struct mach_header* mh, intptr_t slide) {
     for(uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -851,10 +856,21 @@ static void shdw_svc_image_add(const struct mach_header* mh, intptr_t slide) {
 
     // Trailing debounce: each record pushes the deadline out, so an image-load
     // burst (hundreds of dlopens at app startup) coalesces into one drain after
-    // it goes quiet instead of a stop-the-world patch every 250ms mid-storm.
+    // it goes quiet instead of a stop-the-world patch every few ms mid-storm.
     atomic_store_explicit(&shdw_svc_drain_deadline,
         clock_gettime_nsec_np(CLOCK_MONOTONIC) + SHDW_SVC_DRAIN_QUIET_NS,
         memory_order_release);
+
+    // Batch cap fires immediately: during a continuous dlopen storm the
+    // trailing window never opens, so cap how long svc sites can sit unpatched.
+    if(shdw_svc_queue_count >= SHDW_SVC_DRAIN_BATCH) {
+        atomic_store_explicit(&shdw_svc_drain_deadline, 0, memory_order_release);
+        if(!atomic_exchange_explicit(&shdw_svc_drain_pending, YES, memory_order_acq_rel)) {
+            dispatch_after_f(DISPATCH_TIME_NOW,
+                             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, shdw_svc_drain_async);
+        }
+        return;
+    }
 
     if(!atomic_exchange_explicit(&shdw_svc_drain_pending, YES, memory_order_acq_rel)) {
         dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)SHDW_SVC_DRAIN_QUIET_NS),

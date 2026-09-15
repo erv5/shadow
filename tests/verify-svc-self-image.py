@@ -83,6 +83,7 @@ static _Atomic BOOL shdw_svc_drain_pending = NO;
 static _Atomic uint64_t shdw_svc_drain_deadline = 0;
 
 #define SHDW_SVC_DRAIN_QUIET_NS (400ull * 1000000ull)
+#define SHDW_SVC_DRAIN_BATCH 64
 /* clock_gettime_nsec_np is Apple-only; the test drives the drain explicitly,
    so the deadline value never matters here. */
 #define clock_gettime_nsec_np(x) 0
