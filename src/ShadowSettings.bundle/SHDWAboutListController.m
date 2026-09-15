@@ -39,7 +39,7 @@
 }
 
 - (NSString *)aboutDeveloper:(id)sender {
-	return @"erv5 — fork of jjolano/shadow";
+	return @"erv5 (fork of jjolano/shadow)";
 }
 
 - (NSString *)aboutTranslator:(id)sender {

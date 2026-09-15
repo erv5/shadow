@@ -35,7 +35,7 @@
 
 		// One Follow Global toggle governs the whole app: following global =
 		// no per-app overrides, so both the activation and aggressive rows are
-		// hidden — together with the now-empty Neutralization group header —
+		// hidden (together with the now-empty Neutralization group header)
 		// until the user opts out.
 		if([self followGlobal]) {
 			[self removeSpecifier:enabledSpecifier animated:NO];

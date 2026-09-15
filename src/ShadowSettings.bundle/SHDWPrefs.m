@@ -61,7 +61,7 @@ BOOL SHDWAppFollowsGlobal(NSUserDefaults *prefs, NSString *appID) {
 	return !SHDWAppIsCustomized([prefs dictionaryForKey:appID]);
 }
 
-// Every plugin prefKey (Universal_*/Adapter_*) — the per-app toggle surface.
+// Every plugin prefKey (Universal_*/Adapter_*), i.e. the per-app toggle surface.
 static NSArray<NSString*>* SHDWHookTogglePrefKeys(void) {
 	static NSArray<NSString*>* keys = nil;
 	static dispatch_once_t once;
