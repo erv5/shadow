@@ -9,9 +9,11 @@ typedef struct {
     BOOL         used;
 } SHDWPrologueEntry;
 
-// Bounded table: Shadow hooks a fixed, modest set of functions per process.
-// 256 entries comfortably covers every inline-lane hook Shadow installs.
-#define SHDW_PROLOGUE_MAX 256
+// Bounded table: Shadow hooks a fixed, modest set of functions per process,
+// plus every raw-svc site the svc patcher rewrites in app-bundled detector
+// code (a BShield-class SDK alone carries ~100 such sites). 2048 covers both
+// with headroom; each entry is 40 bytes.
+#define SHDW_PROLOGUE_MAX 2048
 
 static SHDWPrologueEntry gRegistry[SHDW_PROLOGUE_MAX];
 static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;

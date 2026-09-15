@@ -569,20 +569,49 @@ static const shdw_mach_sym_policy_entry_t shdw_mach_sym_policy_table[] = {
     { "xpc_connection_resume", (void*)&replaced_xpc_connection_resume, (void* const*)&original_xpc_connection_resume },
 };
 
+// Sorted index over the table, built on first use: dlsym policy lookups miss
+// for every ordinary symbol and scanned the whole table linearly.
+#define SHDW_MACH_SYM_COUNT (sizeof(shdw_mach_sym_policy_table) / sizeof(shdw_mach_sym_policy_table[0]))
+
+static int shdw_mach_sym_compare(const void* a, const void* b) {
+    const shdw_mach_sym_policy_entry_t* ra = *(const shdw_mach_sym_policy_entry_t* const*)a;
+    const shdw_mach_sym_policy_entry_t* rb = *(const shdw_mach_sym_policy_entry_t* const*)b;
+    return strcmp(ra->name, rb->name);
+}
+
+static const shdw_mach_sym_policy_entry_t* shdw_mach_sym_sorted[SHDW_MACH_SYM_COUNT];
+static dispatch_once_t shdw_mach_sym_sort_once;
+
+static void shdw_mach_sym_sort(void* unused) {
+    (void)unused;
+
+    for(size_t i = 0; i < SHDW_MACH_SYM_COUNT; i++) {
+        shdw_mach_sym_sorted[i] = &shdw_mach_sym_policy_table[i];
+    }
+
+    qsort(shdw_mach_sym_sorted, SHDW_MACH_SYM_COUNT, sizeof(shdw_mach_sym_sorted[0]), shdw_mach_sym_compare);
+}
+
 void* shdw_sym_policy_lookup_mach(const char* name) {
     if(!name) {
         return NULL;
     }
 
-    for(size_t i = 0; i < sizeof(shdw_mach_sym_policy_table) / sizeof(shdw_mach_sym_policy_table[0]); i++) {
-        if(strcmp(name, shdw_mach_sym_policy_table[i].name) == 0) {
-            if(shdw_mach_sym_policy_table[i].original && *shdw_mach_sym_policy_table[i].original == NULL) {
-                return NULL;  // runtime-resolved symbol not installed
-            }
+    dispatch_once_f(&shdw_mach_sym_sort_once, NULL, shdw_mach_sym_sort);
 
-            return shdw_mach_sym_policy_table[i].replacement;
-        }
+    shdw_mach_sym_policy_entry_t key = { name, NULL, NULL };
+    const shdw_mach_sym_policy_entry_t* keyp = &key;
+    const shdw_mach_sym_policy_entry_t** hit = bsearch(&keyp, shdw_mach_sym_sorted, SHDW_MACH_SYM_COUNT, sizeof(shdw_mach_sym_sorted[0]), shdw_mach_sym_compare);
+
+    if(!hit) {
+        return NULL;
     }
 
-    return NULL;
+    const shdw_mach_sym_policy_entry_t* d = *hit;
+
+    if(d->original && *d->original == NULL) {
+        return NULL;  // runtime-resolved symbol not installed
+    }
+
+    return d->replacement;
 }

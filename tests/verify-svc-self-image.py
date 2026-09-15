@@ -22,7 +22,9 @@ def body(source: str, signature: str) -> str:
 
 source = SOURCE.read_text()
 skip = body(source, "static BOOL shdw_svc_skip_image(")
+header = body(source, "static void shdw_svc_patch_header(")
 callback = body(source, "static void shdw_svc_image_add(")
+deferred = body(source, "void shdw_svc_patch_deferred(void)")
 install = body(source, "void shdw_svc_patch_install(void)")
 
 # The app-bundle exemption remains a path-policy decision. Scanner identity is
@@ -30,7 +32,20 @@ install = body(source, "void shdw_svc_patch_install(void)")
 bundle_start = skip.index("if([imagePath isEqualToString:bundlePath]")
 bundle_end = skip.index("// dyld reports", bundle_start)
 assert "return NO;" in skip[bundle_start:bundle_end]
-assert callback.index("if(!shdw_svc_own_image || mh == shdw_svc_own_image)") < callback.index("for(uint32_t")
+
+# Identity exclusion precedes any queue/patch work, and images queue (not
+# patch) on the add path — the drainer does the scanning off the load path.
+assert callback.index("if(!shdw_svc_own_image || mh == shdw_svc_own_image)") < callback.index(
+    "pthread_mutex_lock(&shdw_svc_queue_lock)"
+)
+assert callback.index("shdw_svc_queue_count++") < callback.index("shdw_svc_patch_header(mh, slide)")
+
+# The drain takes the queue lock and empties the queue before scanning.
+assert deferred.index("pthread_mutex_lock(&shdw_svc_queue_lock)") < deferred.index(
+    "shdw_svc_patch_header(pending[i]"
+)
+assert deferred.index("shdw_svc_queue_count = 0") < deferred.index("pthread_mutex_unlock")
+
 assert install.index("dladdr((const void*)shdw_svc_patch_install, &info)") < install.index(
     "_dyld_register_func_for_add_image"
 )
@@ -39,8 +54,16 @@ prefix = r'''
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
+
+/* The add-image callback schedules its drain with libdispatch; the test
+   drives the drain explicitly, so the debounce timer is swallowed whole
+   (its block/function argument never reaches the compiler). */
+#define dispatch_after(...) ((void)0)
+#define dispatch_after_f(...) ((void)0)
 
 typedef int BOOL;
 #define NO 0
@@ -49,8 +72,22 @@ typedef int BOOL;
 struct mach_header { int marker; };
 typedef struct { const char *dli_fname; void *dli_fbase; } Dl_info;
 
+#define SHDW_SVC_QUEUE_MAX 1024
+
 static const struct mach_header *shdw_svc_own_image = NULL;
-static struct mach_header self_header, app_header;
+static pthread_mutex_t shdw_svc_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static const struct mach_header *shdw_svc_queue[SHDW_SVC_QUEUE_MAX];
+static intptr_t shdw_svc_queue_slide[SHDW_SVC_QUEUE_MAX];
+static size_t shdw_svc_queue_count = 0;
+static _Atomic BOOL shdw_svc_drain_pending = NO;
+static _Atomic uint64_t shdw_svc_drain_deadline = 0;
+
+#define SHDW_SVC_DRAIN_QUIET_NS (400ull * 1000000ull)
+/* clock_gettime_nsec_np is Apple-only; the test drives the drain explicitly,
+   so the deadline value never matters here. */
+#define clock_gettime_nsec_np(x) 0
+
+static struct mach_header self_header, app_header, app_header2;
 static const struct mach_header *images[2];
 static const char *paths[2];
 static uint32_t image_count;
@@ -133,13 +170,32 @@ int main(void) {
     assert(image_count_calls == 0);
     assert(patches == 0);
 
-    /* A different image beneath the app bundle remains admitted. */
+    /* A different image beneath the app bundle queues — no inline patch. */
     shdw_svc_own_image = &self_header;
     set_image(&app_header, "/bundle/Detector.dylib");
     shdw_svc_image_add(&app_header, 0);
-    assert(image_count_calls == 1);
+    assert(patches == 0);
+    assert(shdw_svc_queue_count == 1);
+    assert(shdw_svc_drain_pending == YES);
+
+    /* The drain scans queued images and empties the queue. */
+    shdw_svc_patch_deferred();
     assert(patches == 1);
     assert(last_patched == &app_header);
+    assert(shdw_svc_queue_count == 0);
+
+    /* Images keep queueing after a drain; drain again scans them. */
+    set_image(&app_header2, "/bundle/Late.framework/Late");
+    shdw_svc_image_add(&app_header2, 0);
+    assert(patches == 1);
+    assert(shdw_svc_queue_count == 1);
+    shdw_svc_patch_deferred();
+    assert(patches == 2);
+    assert(last_patched == &app_header2);
+
+    /* An empty drain is a no-op. */
+    shdw_svc_patch_deferred();
+    assert(patches == 2);
 
     puts("verify-svc-self-image: scanner admission assertions passed");
     return 0;
@@ -149,7 +205,9 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix="shadow-svc-self-image-") as tmp:
     test = Path(tmp) / "test.c"
     executable = Path(tmp) / "test"
-    test.write_text(prefix + callback + "\n\n" + install + suffix)
+    test.write_text(
+        prefix + header + "\n\n" + callback + "\n\n" + deferred + "\n\n" + install + suffix
+    )
     subprocess.run([
         os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
         str(test), "-o", str(executable),

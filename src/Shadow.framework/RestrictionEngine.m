@@ -8,6 +8,7 @@
 #import "../common.h"
 
 #import <limits.h>
+#import <stdatomic.h>
 #import <unistd.h>
 #import <dlfcn.h>
 #import <string.h>
@@ -39,7 +40,10 @@ static BOOL shdwDetectorPathRestricted(const char* path) {
 // via the generation tag; this shrinks the filesystem-appearance window.
 // Finding 10 residual: the 0.5s window is also a timing side-channel (hit vs
 // miss latency can reveal a recent identical probe), but verdicts stay
-// identical so only timing leaks. Count limits (1024/1024) unchanged.
+// identical so only timing leaks. Cache capacity 4096/4096 (up from
+// 1024/1024): heavy apps churn thousands of distinct paths per second and
+// were thrashing the smaller caches; freshness is still bounded by the TTL
+// and generation tags, capacity only affects hit rate.
 static const NSTimeInterval kShadowDecisionCacheTTL = 0.5;
 
 // Restricted roots single source via JBPath (shdw_is_restricted_root).
@@ -194,9 +198,9 @@ static BOOL shdwSnapshotDeniesPath(ShadowRulesetSnapshot* snapshot, NSString* pa
         pseudoSandboxMode = ShadowPseudoSandboxModeOff;
         store = [ShadowRulesetStore new];
         sharedCache = [NSCache new];
-        [sharedCache setCountLimit:1024];
+        [sharedCache setCountLimit:4096];
         rulesetCache = [NSCache new];
-        [rulesetCache setCountLimit:1024];
+        [rulesetCache setCountLimit:4096];
     }
 
     return self;
@@ -371,7 +375,9 @@ static BOOL shdwSnapshotDeniesPath(ShadowRulesetSnapshot* snapshot, NSString* pa
         static __thread NSUInteger lastGen = 0;
         static __thread uintptr_t lastEngine = 0;
         static __thread ShadowPseudoSandboxMode lastPseudoMode = ShadowPseudoSandboxModeOff;
-        NSUInteger gen = [store generation];
+        // Lock-free generation read: the atomic is published after each
+        // snapshot swap, so cache tagging does not need store's mutex.
+        NSUInteger gen = (NSUInteger)atomic_load_explicit(&shdw_ruleset_generation, memory_order_acquire);
         if (lastValid && lastEngine == (uintptr_t)self && lastGen == gen && lastPseudoMode == pseudoMode && path && query.workingDirectory == nil && query.operation == ShadowRestrictionOperationRead && query.flags == ShadowRestrictionFlagResolve) {
             const char *cur = [path fileSystemRepresentation];
             if (cur && strcmp(cur, lastPathBuf) == 0) return lastVerdict;
@@ -399,7 +405,7 @@ static BOOL shdwSnapshotDeniesPath(ShadowRulesetSnapshot* snapshot, NSString* pa
         }
 
         if(cacheable) {
-            NSInteger cached = [self _cachedVerdictForKey:cacheKey generation:[store generation] cache:sharedCache];
+            NSInteger cached = [self _cachedVerdictForKey:cacheKey generation:gen cache:sharedCache];
 
             if(cached >= 0) {
                 const char *cur = [path fileSystemRepresentation];
@@ -539,7 +545,7 @@ static BOOL shdwSnapshotDeniesPath(ShadowRulesetSnapshot* snapshot, NSString* pa
         }
 
         if(cacheable) {
-            [self _storeVerdict:restricted forKey:cacheKey generation:[store generation] cache:sharedCache];
+            [self _storeVerdict:restricted forKey:cacheKey generation:gen cache:sharedCache];
             const char *cur = [query.path fileSystemRepresentation];
             if (cur) { strlcpy(lastPathBuf, cur, sizeof(lastPathBuf)); lastVerdict = restricted; lastValid = YES; lastGen = gen; lastEngine = (uintptr_t)self; lastPseudoMode = pseudoMode; }
         }

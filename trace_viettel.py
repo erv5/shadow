@@ -4,7 +4,7 @@ so we can tell if Shadow is neutralizing them or if something leaks."""
 import frida, sys, threading
 
 DEV = "00008030-001170403E32402E"
-APP = "com.viettel.ttnd.vietteldiscovery"
+APP = sys.argv[1] if len(sys.argv)>1 else "com.viettel.ttnd.vietteldiscovery"
 
 JS = r"""
 'use strict';
@@ -95,8 +95,8 @@ def main():
     sc = s.create_script(JS); sc.on("message", on_msg); sc.load()
     print("[*] armed, resuming", flush=True)
     d.resume(pid)
-    print("[*] watching 45s — open/use the app now", flush=True)
-    threading.Event().wait(45)
+    print("[*] watching 150s — open/use the app now", flush=True)
+    threading.Event().wait(150)
     print("[*] done", flush=True)
 
 if __name__ == "__main__":

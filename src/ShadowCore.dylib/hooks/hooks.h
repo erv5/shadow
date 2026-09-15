@@ -318,6 +318,13 @@ extern BOOL shdw_detector_aggressive;
 // surface is re-exposed (detection exposure returns) but the crash stops.
 extern BOOL shdw_memory_hiding_enabled;
 
+// NO when HK_Library pins a non-ellekit backend for this app (set by
+// shadowcore.x at ctor). The sandbox task_set_exception_ports hook then drops
+// ElleKit's task-handler registration: the brk lane is unused, and the
+// handler only adds its fatal altstack guard on top of the app's own RASP
+// exception handling.
+extern BOOL shdw_ellekit_lane;
+
 // Behavioral tripwire escalation (dylib.x): called when a non-tweak caller
 // probes the jailbreak (JB-indicator path/symbol/dylib) or a known detector
 // loads post-spawn. Idempotent; installs the detector-gated hook groups the
@@ -370,6 +377,11 @@ int shdw_filter_mounts(struct statfs* buf, int count, BOOL statfsFlags);
 // (synthetic ENOENT for restricted paths, original svc otherwise). Called
 // from the universal syscall installer, so its preference gates it. Idempotent.
 void shdw_svc_patch_install(void);
+
+// Scans images queued at add time (svc_patch.x). Called on detector
+// escalation for an immediate synchronous drain; otherwise a utility-queue
+// debounce drains it. Safe from any thread, idempotent.
+void shdw_svc_patch_deferred(void);
 
 // YES when the return address lies inside the Security.framework image.
 // Used by the csops policy: Security constructs its own code-identity views

@@ -2978,6 +2978,22 @@ void shdw_libc_install_group(SHDWHookSession* hooks, uint32_t group) {
                 }
             }
 
+            // Same shared-cache constraint for getenv: a short/unaligned
+            // export stub refuses the inline patch, and the row has no other
+            // lane — leaving getenv unhooked leaks DYLD_INSERT_LIBRARIES
+            // ("/usr/lib/systemhook.dylib") to any app that reads it, which is
+            // exactly what hook-integrity checks probe. Rebind the import
+            // slots instead and keep the verified export as the continuation.
+            if(!installed && d->original && group == SHADW_HOOK_GROUP_ENVVAR) {
+                [hooks hookRebindSymbol:[NSString stringWithUTF8String:d->symbol]
+                        withReplacement:d->replacement
+                               outOldPtr:d->original];
+                if(*d->original == NULL) {
+                    *d->original = target;
+                }
+                installed = YES;
+            }
+
             // Same iOS-15 shared-cache constraint for the directory-enumeration
             // and mount-table entrypoints: when the inline patch is refused the
             // symbol is left unhooked, so a listing exposes what the point-lookup
@@ -3100,28 +3116,57 @@ void* shdw_libc_null_original(const char* symbol) {
 // to its replacement when the hook actually installed (original != NULL), so
 // runtime-conditional symbols that are absent on a given OS stay absent.
 // NULL-original rows (wait family) gate on their resolved continuation cell.
+//
+// Sorted index over shdw_libc_hooks, built on first use: dlsym policy lookups
+// miss for every ordinary symbol and scanned the whole ~110-row table
+// linearly. Install order in the table is unchanged; the index is separate.
+#define SHDW_LIBC_HOOK_COUNT (sizeof(shdw_libc_hooks) / sizeof(shdw_libc_hooks[0]))
+
+static int shdw_libc_sym_compare(const void* a, const void* b) {
+    const shdw_hook_desc_t* ra = *(const shdw_hook_desc_t* const*)a;
+    const shdw_hook_desc_t* rb = *(const shdw_hook_desc_t* const*)b;
+    return strcmp(ra->symbol, rb->symbol);
+}
+
+static const shdw_hook_desc_t* shdw_libc_sym_sorted[SHDW_LIBC_HOOK_COUNT];
+static dispatch_once_t shdw_libc_sym_sort_once;
+
+static void shdw_libc_sym_sort(void* unused) {
+    (void)unused;
+
+    for(size_t i = 0; i < SHDW_LIBC_HOOK_COUNT; i++) {
+        shdw_libc_sym_sorted[i] = &shdw_libc_hooks[i];
+    }
+
+    qsort(shdw_libc_sym_sorted, SHDW_LIBC_HOOK_COUNT, sizeof(shdw_libc_sym_sorted[0]), shdw_libc_sym_compare);
+}
+
 void* shdw_sym_policy_lookup_libc(const char* name) {
     if(!name) {
         return NULL;
     }
 
-    for(size_t i = 0; i < sizeof(shdw_libc_hooks) / sizeof(shdw_libc_hooks[0]); i++) {
-        const shdw_hook_desc_t* d = &shdw_libc_hooks[i];
+    dispatch_once_f(&shdw_libc_sym_sort_once, NULL, shdw_libc_sym_sort);
 
-        if(strcmp(name, d->symbol) == 0) {
-            if(!d->original) {
-                return shdw_libc_null_original(name) ? d->replacement : NULL;
-            }
+    shdw_hook_desc_t key = { name, NULL, NULL, 0, 0 };
+    const shdw_hook_desc_t* keyp = &key;
+    const shdw_hook_desc_t** hit = bsearch(&keyp, shdw_libc_sym_sorted, SHDW_LIBC_HOOK_COUNT, sizeof(shdw_libc_sym_sorted[0]), shdw_libc_sym_compare);
 
-            if(*d->original == NULL) {
-                return NULL;  // runtime-conditional symbol not installed
-            }
-
-            return d->replacement;
-        }
+    if(!hit) {
+        return NULL;
     }
 
-    return NULL;
+    const shdw_hook_desc_t* d = *hit;
+
+    if(!d->original) {
+        return shdw_libc_null_original(d->symbol) ? d->replacement : NULL;
+    }
+
+    if(*d->original == NULL) {
+        return NULL;  // runtime-conditional symbol not installed
+    }
+
+    return d->replacement;
 }
 
 // Reverse of the policy lookup: given a replacement address (what dlsym hands

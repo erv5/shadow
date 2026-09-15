@@ -39,7 +39,7 @@
 }
 
 - (NSString *)aboutDeveloper:(id)sender {
-	return @"jjolano";
+	return @"erv5 — fork of jjolano/shadow";
 }
 
 - (NSString *)aboutTranslator:(id)sender {
@@ -51,7 +51,7 @@
 }
 
 - (void)openGitHub:(id)sender {
-	[self openExternalURL:[NSURL URLWithString:@"https://github.com/jjolano/shadow"]];
+	[self openExternalURL:[NSURL URLWithString:@"https://github.com/erv5/shadow"]];
 }
 
 - (void)openKofi:(id)sender {

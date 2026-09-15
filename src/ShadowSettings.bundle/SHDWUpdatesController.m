@@ -60,7 +60,7 @@
 	NSUInteger generation = ++requestGeneration;
 
 	// Preserve the release-list selection, excluding artifact-only tags and prereleases.
-	NSURL* updateURL = [NSURL URLWithString:@"https://api.github.com/repos/jjolano/shadow/releases?per_page=10"];
+	NSURL* updateURL = [NSURL URLWithString:@"https://api.github.com/repos/erv5/shadow/releases?per_page=10"];
 	NSURLSessionConfiguration* configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
 	configuration.timeoutIntervalForRequest = 30;
 	configuration.timeoutIntervalForResource = 60;
@@ -99,7 +99,7 @@
 						NSString* htmlURL = release[@"html_url"];
 						if([htmlURL isKindOfClass:[NSString class]]) {
 							NSURLComponents* components = [NSURLComponents componentsWithString:htmlURL];
-							NSString* prefix = @"/jjolano/shadow/releases/tag/";
+							NSString* prefix = @"/erv5/shadow/releases/tag/";
 							NSString* path = components.percentEncodedPath;
 							if([components.scheme isEqualToString:@"https"] && [components.host isEqualToString:@"github.com"] &&
 							   !components.port && !components.user && !components.password && !components.query && !components.fragment &&

@@ -18,13 +18,16 @@
 #import "UniversalHooks.h"
 #import "../../policy/PathPolicy.h"
 #import "../../policy/ProcessPolicy.h"
+#import "../../SHDWPrologueRegistry.h"
 #import "path_rewrite.h"
 
 #import <libkern/OSCacheControl.h>
 #import <pthread.h>
+#import <stdlib.h>
 #import <sys/event.h>
 #import <sys/syscall.h>
 #import <fcntl.h>
+#import <time.h>
 #import <unistd.h>
 
 #if defined(__arm64__)
@@ -75,6 +78,19 @@ __attribute__((used, noinline)) int shdw_svc_should_deny(uint64_t sysno, uint64_
     // (ShadowCore) address.
     if(!shdw_caller_is_external((const void*)caller_lr)) {
         return 0;
+    }
+
+    // Indirect-syscall site: svc with x16=0 (SYS_syscall) carries the real
+    // number in the first argument register and every argument shifts one
+    // register. BShield hides a probe's number this way. Re-dispatch on the
+    // real number; the trampoline only captured through a2, so an indirect
+    // kevent (which needs a3) fails open rather than misreads a register.
+    if((int)sysno == SYS_syscall) {
+        int real = (int)a0;
+        if(real == SYS_syscall || real < 0) {
+            return 0;
+        }
+        return shdw_svc_should_deny((uint64_t)real, a1, a2, 0, caller_lr);
     }
 
     shdw_raw_syscall_category_t cat = shdw_raw_syscall_category((int)sysno);
@@ -388,6 +404,12 @@ static void shdw_svc_try_patch_site(uintptr_t site, uint32_t insn, const char* w
         return;
     }
 
+    // A detector reading its own __TEXT back (BShield's vm_read_overwrite
+    // self-scan) would see the branch where its svc word was. Record the
+    // pristine bytes first so the registry replays them on such reads —
+    // the same cover the HookKit inline sites already get.
+    SHDWPrologueRecord((const void*)site);
+
     *(uint32_t*)site = 0x94000000 | ((uint32_t)(delta >> 2) & 0x3FFFFFF);
     sys_icache_invalidate((void*)site, 4);
 }
@@ -396,23 +418,6 @@ static void shdw_svc_try_patch_site(uintptr_t site, uint32_t insn, const char* w
 // same-thread callback without deadlocking; nested stop/resume pairs preserve
 // the outer suspension counts.
 static pthread_mutex_t shdw_svc_patch_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
-
-static BOOL shdw_svc_range_has_site(uintptr_t addr, size_t size) {
-    if(size < 4 || addr > UINTPTR_MAX - size) {
-        return NO;
-    }
-
-    const uint32_t* words = (const uint32_t*)addr;
-    size_t nwords = size / 4;
-
-    for(size_t w = 0; w < nwords; w++) {
-        if(shdw_svc_is_instruction(words[w])) {
-            return YES;
-        }
-    }
-
-    return NO;
-}
 
 static void shdw_svc_dispose_thread_list(thread_act_array_t threads,
                                          mach_msg_type_number_t count,
@@ -497,23 +502,72 @@ static void shdw_svc_resume_others(thread_act_array_t threads,
     }
 }
 
-// Patch one executable range. The read-only preflight happens while other
-// threads run; only the final vm_protect/write/reprotect sequence stops them.
-// scan_size may be smaller than protect_size for a Mach-O __TEXT segment.
-static void shdw_svc_patch_memory(uintptr_t addr, size_t scan_size,
-                                  size_t protect_size, vm_prot_t original_prot,
-                                  const char* where) {
-    if(!shdw_svc_range_has_site(addr, scan_size)) {
+// Patch one executable range. The word-wise scan runs unlocked while other
+// threads run, collecting candidate sites; the stop-the-world window then
+// covers only vm_protect + a per-site re-verify/patch, so its cost tracks the
+// number of svc sites rather than the segment size (a deferred 100MB+ main
+// executable freezes a running app for milliseconds, not for the scan).
+// __TEXT changes only through this function (under its lock), so preflight
+// offsets stay valid; each is still re-read under suspension in case a racing
+// scanner patched it. The scan window [scan_addr, +scan_size) is the exact
+// instruction-bearing section; the protect window is its page-aligned cover
+// (vm_protect needs page alignment; a section can start mid-page).
+static void shdw_svc_patch_memory(uintptr_t scan_addr, size_t scan_size,
+                                  uintptr_t protect_addr, size_t protect_size,
+                                  vm_prot_t original_prot, const char* where) {
+    if(scan_size < 4 || scan_addr > UINTPTR_MAX - scan_size) {
+        return;
+    }
+
+    const uint32_t* words = (const uint32_t*)scan_addr;
+    size_t nwords = scan_size / 4;
+
+    size_t* sites = NULL;
+    size_t nsites = 0, capacity = 0;
+
+    for(size_t w = 0; w < nwords; w++) {
+        if(shdw_svc_is_instruction(words[w])) {
+            if(nsites == capacity) {
+                size_t grown = capacity ? capacity * 2 : 64;
+                size_t* resized = realloc(sites, grown * sizeof(*sites));
+
+                if(!resized) {
+                    free(sites);
+                    return;  // fail-soft: leave this range for a later pass
+                }
+
+                sites = resized;
+                capacity = grown;
+            }
+
+            sites[nsites++] = w;
+        }
+    }
+
+    if(!nsites) {
+        free(sites);
         return;
     }
 
     pthread_mutex_lock(&shdw_svc_patch_lock);
 
-    // Another scanner may have patched the site while this caller waited.
-    if(!shdw_svc_range_has_site(addr, scan_size)) {
+    // Another scanner may have patched sites while this caller waited; drop
+    // the dead ones (a patched site reads as a bl, never an svc).
+    size_t live = 0;
+
+    for(size_t s = 0; s < nsites; s++) {
+        if(shdw_svc_is_instruction(words[sites[s]])) {
+            sites[live++] = sites[s];
+        }
+    }
+
+    if(!live) {
         pthread_mutex_unlock(&shdw_svc_patch_lock);
+        free(sites);
         return;
     }
+
+    nsites = live;
 
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t thread_count = 0;
@@ -521,13 +575,14 @@ static void shdw_svc_patch_memory(uintptr_t addr, size_t scan_size,
 
     if(!shdw_svc_suspend_others(&threads, &thread_count, &current)) {
         pthread_mutex_unlock(&shdw_svc_patch_lock);
+        free(sites);
         return;
     }
 
     vm_prot_t restore_prot = original_prot;
     vm_region_basic_info_data_64_t current_info;
     mach_msg_type_number_t current_info_count = VM_REGION_BASIC_INFO_COUNT_64;
-    vm_address_t current_region = addr;
+    vm_address_t current_region = protect_addr;
     vm_size_t current_region_size = 0;
     mach_port_t current_object = MACH_PORT_NULL;
 
@@ -546,6 +601,7 @@ static void shdw_svc_patch_memory(uintptr_t addr, size_t scan_size,
             shdw_svc_resume_others(threads, thread_count, current);
             shdw_svc_dispose_thread_list(threads, thread_count, current);
             pthread_mutex_unlock(&shdw_svc_patch_lock);
+            free(sites);
             return;
         }
 
@@ -560,57 +616,53 @@ static void shdw_svc_patch_memory(uintptr_t addr, size_t scan_size,
     // copy-on-write mapping and raises max_protection to include WRITE; only
     // the written site pages materialize, the rest stay shared. Falls back
     // to plain RW on kernels that reject COPY here; fail-soft either way.
-    // Code-signed __TEXT's max_protection is r-x, so a plain vm_protect
-    // READ|WRITE is denied (KERN_PROTECTION_FAILURE) — the same wall dyld.x's
-    // load-command rewrite hits. Request VM_PROT_COPY, which forces a private
-    // copy-on-write mapping and raises max_protection to include WRITE; only
-    // the written site pages materialize, the rest stay shared. Falls back
-    // to plain RW on kernels that reject COPY here; fail-soft either way.
-    BOOL protected_for_write = vm_protect(mach_task_self(), addr, protect_size,
+    BOOL protected_for_write = vm_protect(mach_task_self(), protect_addr, protect_size,
                                           FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS;
 
     if(!protected_for_write) {
-        protected_for_write = vm_protect(mach_task_self(), addr, protect_size,
+        protected_for_write = vm_protect(mach_task_self(), protect_addr, protect_size,
                                          FALSE, VM_PROT_READ | VM_PROT_WRITE) == KERN_SUCCESS;
     }
 
     BOOL restore_failed = NO;
 
     if(protected_for_write) {
-        uint32_t* words = (uint32_t*)addr;
-        size_t nwords = scan_size / 4;
+        uint32_t* writable = (uint32_t*)scan_addr;
 
-        for(size_t w = 0; w < nwords; w++) {
-            uint32_t insn = words[w];
+        for(size_t s = 0; s < nsites; s++) {
+            size_t w = sites[s];
+            uint32_t insn = writable[w];
 
-            if(shdw_svc_is_instruction(insn)) {
-                // Never redirect a constant-x16 ptrace site. The svc helper
-                // can only allow a ptrace call or synthesize an errno — it
-                // cannot neutralize PT_DENY_ATTACH the way the syscall(2)
-                // dispatch does — and redirecting an early anti-debug
-                // initializer's deny_attach through the trampoline hangs
-                // process init (measured iPhone7/iOS 15.8.3: init stalls
-                // with the main binary's deny_attach site redirected,
-                // completes with it left alone). Leaving the site also
-                // matches every prior build's behavior (the helper never
-                // policed PTRACE). Register-x16 sites always patch: their
-                // number is unknowable statically and the kevent probe path
-                // is one of them.
-                if(shdw_svc_site_const_sysno(words, nwords, w) == SYS_ptrace) {
-                    continue;
-                }
-
-                shdw_svc_try_patch_site(addr + w * 4, insn, where);
+            if(!shdw_svc_is_instruction(insn)) {
+                continue;
             }
+
+            // Never redirect a constant-x16 ptrace site. The svc helper
+            // can only allow a ptrace call or synthesize an errno — it
+            // cannot neutralize PT_DENY_ATTACH the way the syscall(2)
+            // dispatch does — and redirecting an early anti-debug
+            // initializer's deny_attach through the trampoline hangs
+            // process init (measured iPhone7/iOS 15.8.3: init stalls
+            // with the main binary's deny_attach site redirected,
+            // completes with it left alone). Leaving the site also
+            // matches every prior build's behavior (the helper never
+            // policed PTRACE). Register-x16 sites always patch: their
+            // number is unknowable statically and the kevent probe path
+            // is one of them.
+            if(shdw_svc_site_const_sysno(writable, nwords, w) == SYS_ptrace) {
+                continue;
+            }
+
+            shdw_svc_try_patch_site(scan_addr + w * 4, insn, where);
         }
 
         // Restore execute permission before any other thread can run again.
-        if(vm_protect(mach_task_self(), addr, protect_size, FALSE, restore_prot) != KERN_SUCCESS) {
+        if(vm_protect(mach_task_self(), protect_addr, protect_size, FALSE, restore_prot) != KERN_SUCCESS) {
             restore_failed = YES;
             // Keep a failed exact restore from leaving an executable page
             // permanently non-executable. The fallback intentionally favors
             // liveness over preserving an unusual extra protection bit.
-            vm_protect(mach_task_self(), addr, protect_size, FALSE,
+            vm_protect(mach_task_self(), protect_addr, protect_size, FALSE,
                        VM_PROT_READ | VM_PROT_EXECUTE);
         }
     }
@@ -618,6 +670,7 @@ static void shdw_svc_patch_memory(uintptr_t addr, size_t scan_size,
     shdw_svc_resume_others(threads, thread_count, current);
     shdw_svc_dispose_thread_list(threads, thread_count, current);
     pthread_mutex_unlock(&shdw_svc_patch_lock);
+    free(sites);
 
     if(restore_failed) {
         NSLog(@"[Shadow][svc] protection restore failed in %s (fallback RX)", where);
@@ -628,10 +681,14 @@ static void shdw_svc_patch_memory(uintptr_t addr, size_t scan_size,
     }
 }
 
-// Scans one image's __TEXT for svc sites and redirects them to the matching
-// trampoline. vm_protect fail-soft dance mirrors dyld.x's memory-hiding
-// patch: query the original protection, add write, patch, invalidate the
-// icache, restore. Idempotent: patched sites are bl instructions, so a
+// Scans one image's instruction-bearing sections for svc sites and redirects
+// them to the matching trampoline. Only sections flagged as instruction
+// sections are scanned: __TEXT also carries pure-data sections (__const,
+// metadata), and a data word matching the svc encoding is inert — patching it
+// corrupts whatever it actually is (observed on-device: an embedded LZMA blob
+// in a payment SDK's __const got three words rewritten and the app SIGSEGV'd
+// decompressing it). vm_protect fail-soft dance mirrors dyld.x's
+// memory-hiding patch. Idempotent: patched sites are bl instructions, so a
 // re-scan never matches them.
 static void shdw_svc_patch_image(const struct mach_header* mh, intptr_t slide, const char* path) {
     if(mh->magic != MH_MAGIC_64 || mh->cputype != CPU_TYPE_ARM64) {
@@ -644,25 +701,41 @@ static void shdw_svc_patch_image(const struct mach_header* mh, intptr_t slide, c
         if(lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64* seg = (const struct segment_command_64*)lc;
 
-            if(strcmp(seg->segname, "__TEXT") == 0 && seg->filesize >= 4) {
-                uintptr_t base = (uintptr_t)seg->vmaddr + (uintptr_t)slide;
-                size_t size = seg->filesize;
+            if(strcmp(seg->segname, "__TEXT") == 0) {
+                const struct section_64* sect = (const struct section_64*)(seg + 1);
 
-                vm_region_basic_info_data_64_t info;
-                mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
-                vm_address_t region = base;
-                vm_size_t region_size = 0;
-                mach_port_t object_name = MACH_PORT_NULL;
-                vm_prot_t original_prot = VM_PROT_READ | VM_PROT_EXECUTE;
+                for(uint32_t s = 0; s < seg->nsects; s++, sect++) {
+                    if(!(sect->flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS))
+                       || sect->size < 4) {
+                        continue;
+                    }
 
-                kern_return_t region_kr = vm_region_64(mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &info_count, &object_name);
-                shdw_svc_dispose_object(&object_name);
+                    uintptr_t saddr = (uintptr_t)sect->addr + (uintptr_t)slide;
+                    size_t ssize = (size_t)sect->size;
 
-                if(region_kr == KERN_SUCCESS) {
-                    original_prot = info.protection;
+                    // vm_protect needs page-aligned bounds; a section can
+                    // start mid-page. Cover it, scan only the section bytes.
+                    uintptr_t paddr = saddr & ~(uintptr_t)(vm_page_size - 1);
+                    size_t psize = (size_t)(((saddr + ssize + vm_page_size - 1)
+                                             & ~(uintptr_t)(vm_page_size - 1)) - paddr);
+
+                    vm_region_basic_info_data_64_t info;
+                    mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+                    vm_address_t region = saddr;
+                    vm_size_t region_size = 0;
+                    mach_port_t object_name = MACH_PORT_NULL;
+                    vm_prot_t original_prot = VM_PROT_READ | VM_PROT_EXECUTE;
+
+                    kern_return_t region_kr = vm_region_64(mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &info_count, &object_name);
+                    shdw_svc_dispose_object(&object_name);
+
+                    if(region_kr == KERN_SUCCESS) {
+                        original_prot = info.protection;
+                    }
+
+                    shdw_svc_patch_memory(saddr, ssize, paddr, psize, original_prot, path);
                 }
 
-                shdw_svc_patch_memory(base, size, seg->vmsize, original_prot, path);
                 return;
             }
         }
@@ -674,15 +747,33 @@ static void shdw_svc_patch_image(const struct mach_header* mh, intptr_t slide, c
 // Add-image callback: resolve the image path (the callback only carries the
 // header), apply the skip rule, scan. Registered through the REAL dyld
 // registration (the dyld.x hook passes Shadow-internal callers through), so
-// the registration replay covers every already-loaded image — including the
-// app binary — before the app runs.
+// the registration replay covers every already-loaded image before the app
+// runs.
+//
+// Async scan queue: this callback runs inside dyld's load path, so scanning
+// inline would tax every dlopen the app makes — image-heavy apps load
+// hundreds of frameworks at startup, each serialized behind its scan, all
+// under dyld's lock. Images are recorded here and scanned by a utility-queue
+// drainer off the load path (trailing 400ms debounce: a burst coalesces into
+// one drain when it goes quiet rather than a stop-the-world patch every few
+// hundred ms mid-storm). Detector escalation (HookCoordinator calls
+// shdw_svc_patch_deferred) forces an immediate synchronous drain so a detected
+// detector never waits on the queue. A full queue falls back to scanning
+// inline so coverage is never dropped for capacity.
+#define SHDW_SVC_QUEUE_MAX 1024
+
 static const struct mach_header* shdw_svc_own_image = NULL;
 
-static void shdw_svc_image_add(const struct mach_header* mh, intptr_t slide) {
-    if(!shdw_svc_own_image || mh == shdw_svc_own_image) {
-        return;
-    }
+static pthread_mutex_t shdw_svc_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static const struct mach_header* shdw_svc_queue[SHDW_SVC_QUEUE_MAX];
+static intptr_t shdw_svc_queue_slide[SHDW_SVC_QUEUE_MAX];
+static size_t shdw_svc_queue_count = 0;
+static _Atomic BOOL shdw_svc_drain_pending = NO;
+static _Atomic uint64_t shdw_svc_drain_deadline = 0;   // monotonic ns, trailing debounce
 
+#define SHDW_SVC_DRAIN_QUIET_NS (400ull * NSEC_PER_MSEC)
+
+static void shdw_svc_patch_header(const struct mach_header* mh, intptr_t slide) {
     for(uint32_t i = 0; i < _dyld_image_count(); i++) {
         if(_dyld_get_image_header(i) == mh) {
             const char* path = _dyld_get_image_name(i);
@@ -693,6 +784,81 @@ static void shdw_svc_image_add(const struct mach_header* mh, intptr_t slide) {
 
             return;
         }
+    }
+}
+
+// Scans every queued image now. Debounce-scheduled on a utility queue after
+// records; called synchronously by the detector-escalation path.
+void shdw_svc_patch_deferred(void) {
+    const struct mach_header* pending[SHDW_SVC_QUEUE_MAX];
+    intptr_t pending_slide[SHDW_SVC_QUEUE_MAX];
+
+    pthread_mutex_lock(&shdw_svc_queue_lock);
+    size_t pending_count = shdw_svc_queue_count;
+    if(pending_count) {
+        memcpy(pending, shdw_svc_queue, pending_count * sizeof(*pending));
+        memcpy(pending_slide, shdw_svc_queue_slide, pending_count * sizeof(*pending_slide));
+        shdw_svc_queue_count = 0;
+    }
+    pthread_mutex_unlock(&shdw_svc_queue_lock);
+
+    for(size_t i = 0; i < pending_count; i++) {
+        shdw_svc_patch_header(pending[i], pending_slide[i]);
+    }
+}
+
+// Drainer for the trailing debounce (C-function form — dispatch_after_f needs
+// no blocks, so no ARC capture games): re-arms while records keep arriving,
+// drains once the queue has been quiet for SHDW_SVC_DRAIN_QUIET_NS.
+static void shdw_svc_drain_async(void* unused) {
+    (void)unused;
+
+    uint64_t dl = atomic_load_explicit(&shdw_svc_drain_deadline, memory_order_acquire);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+
+    if(now < dl) {
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dl - now)),
+                         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, shdw_svc_drain_async);
+        return;
+    }
+
+    atomic_store_explicit(&shdw_svc_drain_pending, NO, memory_order_release);
+    shdw_svc_patch_deferred();
+}
+
+static void shdw_svc_image_add(const struct mach_header* mh, intptr_t slide) {
+    if(!shdw_svc_own_image || mh == shdw_svc_own_image) {
+        return;
+    }
+
+    BOOL queued = NO;
+
+    pthread_mutex_lock(&shdw_svc_queue_lock);
+
+    if(shdw_svc_queue_count < SHDW_SVC_QUEUE_MAX) {
+        shdw_svc_queue[shdw_svc_queue_count] = mh;
+        shdw_svc_queue_slide[shdw_svc_queue_count] = slide;
+        shdw_svc_queue_count++;
+        queued = YES;
+    }
+
+    pthread_mutex_unlock(&shdw_svc_queue_lock);
+
+    if(!queued) {
+        shdw_svc_patch_header(mh, slide);
+        return;
+    }
+
+    // Trailing debounce: each record pushes the deadline out, so an image-load
+    // burst (hundreds of dlopens at app startup) coalesces into one drain after
+    // it goes quiet instead of a stop-the-world patch every 250ms mid-storm.
+    atomic_store_explicit(&shdw_svc_drain_deadline,
+        clock_gettime_nsec_np(CLOCK_MONOTONIC) + SHDW_SVC_DRAIN_QUIET_NS,
+        memory_order_release);
+
+    if(!atomic_exchange_explicit(&shdw_svc_drain_pending, YES, memory_order_acq_rel)) {
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)SHDW_SVC_DRAIN_QUIET_NS),
+                         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, shdw_svc_drain_async);
     }
 }
 
@@ -720,6 +886,9 @@ void shdw_svc_patch_install(void) {
 // Rootful-legacy armv7 lane: no ARM64 svc interception (arm64-only
 // encoding scan; see the file header). The stub keeps syscall.x linkable.
 void shdw_svc_patch_install(void) {
+}
+
+void shdw_svc_patch_deferred(void) {
 }
 
 #endif  // __arm64__

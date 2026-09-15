@@ -26,6 +26,7 @@ prefix = r'''
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 typedef bool BOOL;
 static bool external = true;

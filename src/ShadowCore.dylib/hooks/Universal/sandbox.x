@@ -5,9 +5,11 @@
 
 #import <unistd.h>
 #import <wordexp.h>
+#import <pthread.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <mach/exception_types.h>
 
 // Present from the iOS 15 rootless floor.  Older SDKs did not expose the
 // name, but forwarding command 102 is harmless there: only a successful
@@ -779,6 +781,71 @@ static int replaced_sandbox_check_by_audit_token(audit_token_t token, const char
 // ANY non-null handler as injection evidence. Return an empty handler set for
 // external self-task queries so the process looks pristine; internal Shadow
 // callers see truth.
+//
+// Tracked exception: handlers the APP installed itself AFTER injection (via the
+// hooked task_set_exception_ports below) are preserved verbatim. A RASP that
+// installs its own crash handler and then verifies it (BShield installs two)
+// would otherwise see its handler collapsed by this mask and flag the process
+// as tampered BECAUSE Shadow is active. Only un-tracked (pre-injection /
+// jailbreak-era) handler records get collapsed now.
+#define SHDW_MAX_TRACKED_EXC_HANDLERS 16
+static mach_port_t shdw_tracked_exc_ports[SHDW_MAX_TRACKED_EXC_HANDLERS];
+static pthread_mutex_t shdw_exc_ports_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static BOOL shdw_exc_handler_tracked(mach_port_t port) {
+    if(port == MACH_PORT_NULL) {
+        return NO;
+    }
+
+    BOOL tracked = NO;
+    pthread_mutex_lock(&shdw_exc_ports_lock);
+
+    for(int i = 0; i < SHDW_MAX_TRACKED_EXC_HANDLERS; i++) {
+        if(shdw_tracked_exc_ports[i] == port) {
+            tracked = YES;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&shdw_exc_ports_lock);
+    return tracked;
+}
+
+static kern_return_t (*original_task_set_exception_ports)(task_t task, exception_mask_t exception_mask, exception_handler_t new_handler, exception_behavior_t behavior, thread_state_flavor_t new_flavor);
+static kern_return_t replaced_task_set_exception_ports(task_t task, exception_mask_t exception_mask, exception_handler_t new_handler, exception_behavior_t behavior, thread_state_flavor_t new_flavor) {
+    // With the ellekit brk lane disabled for this app (HK_Library override),
+    // ElleKit's task-level exception handler is dead weight with a fatal edge:
+    // its altstack guard exits the process when an exception (deliberate RASP
+    // trap or real fault) arrives while it is handling one. Suppress the
+    // registration (reported as successful) so the app's own handlers stand.
+    if(!shdw_ellekit_lane && isCallerExternal() && task == mach_task_self()) {
+        Dl_info info;
+        if(dladdr(__builtin_return_address(0), &info) && info.dli_fname
+           && strstr(info.dli_fname, "ellekit")) {
+            return KERN_SUCCESS;
+        }
+    }
+
+    kern_return_t result = original_task_set_exception_ports(task, exception_mask, new_handler, behavior, new_flavor);
+
+    if(result == KERN_SUCCESS && isCallerExternal()
+       && task == mach_task_self() && new_handler != MACH_PORT_NULL) {
+        pthread_mutex_lock(&shdw_exc_ports_lock);
+
+        for(int i = 0; i < SHDW_MAX_TRACKED_EXC_HANDLERS; i++) {
+            if(shdw_tracked_exc_ports[i] == MACH_PORT_NULL
+               || shdw_tracked_exc_ports[i] == new_handler) {
+                shdw_tracked_exc_ports[i] = new_handler;
+                break;
+            }
+        }
+
+        pthread_mutex_unlock(&shdw_exc_ports_lock);
+    }
+
+    return result;
+}
+
 static kern_return_t (*original_task_get_exception_ports)(task_t task, exception_mask_t exception_mask, exception_mask_array_t masks, mach_msg_type_number_t *masksCnt, exception_handler_array_t old_handlers, exception_behavior_array_t old_behaviors, exception_flavor_array_t old_flavors);
 static kern_return_t replaced_task_get_exception_ports(task_t task, exception_mask_t exception_mask, exception_mask_array_t masks, mach_msg_type_number_t *masksCnt, exception_handler_array_t old_handlers, exception_behavior_array_t old_behaviors, exception_flavor_array_t old_flavors) {
     kern_return_t result = original_task_get_exception_ports(task, exception_mask, masks, masksCnt, old_handlers, old_behaviors, old_flavors);
@@ -797,7 +864,8 @@ static kern_return_t replaced_task_get_exception_ports(task_t task, exception_ma
     // exception-port probes flag ANY non-null handler for the debugger-relevant
     // masks. A pre-injection snapshot is unreliable — ElleKit may register its
     // handler in its own load constructor, before the ShadowCore ctor could
-    // snapshot — so drop every handler right the query would return.
+    // snapshot — so drop every handler right the query would return, EXCEPT
+    // records the app itself installed after injection (tracked above).
     //
     // Shape matters as much as content: on a stock process the kernel coalesces
     // every requested mask under the shared null handler into a SINGLE record
@@ -809,18 +877,35 @@ static kern_return_t replaced_task_get_exception_ports(task_t task, exception_ma
     // handler" probes and "exactly one null record" probes. Internal callers
     // (above) still see the real ports for Shadow's own use.
     exception_mask_t unionMask = 0;
+    mach_msg_type_number_t out = 0;
+
     for(mach_msg_type_number_t i = 0; i < *masksCnt; i++) {
+        if(shdw_exc_handler_tracked(old_handlers[i])) {
+            masks[out] = masks[i];
+            old_handlers[out] = old_handlers[i];
+            old_behaviors[out] = old_behaviors[i];
+            old_flavors[out] = old_flavors[i];
+            out++;
+            continue;
+        }
+
         unionMask |= masks[i];
+
         if(old_handlers[i] != MACH_PORT_NULL) {
             mach_port_deallocate(mach_task_self(), old_handlers[i]);
         }
     }
-    if(unionMask == 0) unionMask = EXC_MASK_ALL;
-    masks[0] = unionMask;
-    old_handlers[0] = MACH_PORT_NULL;
-    old_behaviors[0] = 0;
-    old_flavors[0] = 0;
-    *masksCnt = 1;
+
+    if(unionMask || out == 0) {
+        if(unionMask == 0) unionMask = EXC_MASK_ALL;
+        masks[out] = unionMask;
+        old_handlers[out] = MACH_PORT_NULL;
+        old_behaviors[out] = 0;
+        old_flavors[out] = 0;
+        out++;
+    }
+
+    *masksCnt = out;
     return result;
 }
 
@@ -951,6 +1036,19 @@ void shdw_universal_sandbox(SHDWHookSession* hooks) {
         original_task_get_exception_ports = sym_misc;
     }
 
+    // The setter twin: tracking app-installed handlers is what lets the getter
+    // preserve them (see replaced_task_get_exception_ports).
+    void* sym_set_exc = shdw_resolve_libsystem("_task_set_exception_ports");
+    if(sym_set_exc) {
+        [hooks hookFunction:sym_set_exc withReplacement:replaced_task_set_exception_ports outOldPtr:(void **) &original_task_set_exception_ports];
+    }
+    [hooks hookRebindSymbol:@"task_set_exception_ports"
+            withReplacement:replaced_task_set_exception_ports
+                   outOldPtr:(void **) &original_task_set_exception_ports];
+    if(!original_task_set_exception_ports && sym_set_exc) {
+        original_task_set_exception_ports = sym_set_exc;
+    }
+
     // connect: runtime-resolved like _signal/_system; absent on exotic OS → skip.
     void* sym_connect = shdw_resolve_libsystem("_connect");
     if(sym_connect) {
@@ -994,6 +1092,7 @@ static const shdw_sandbox_sym_policy_entry_t shdw_sandbox_sym_policy_table[] = {
     { "system", (void*)&replaced_system, (void* const*)&original_system },
     { "task_for_pid", (void*)&replaced_task_for_pid, (void* const*)&original_task_for_pid },
     { "task_get_exception_ports", (void*)&replaced_task_get_exception_ports, (void* const*)&original_task_get_exception_ports },
+    { "task_set_exception_ports", (void*)&replaced_task_set_exception_ports, (void* const*)&original_task_set_exception_ports },
     { "task_get_special_port", (void*)&replaced_task_get_special_port, (void* const*)&original_task_get_special_port },
     { "vfork", (void*)&replaced_vfork, (void* const*)&original_vfork },
     { "wordexp", (void*)&replaced_wordexp, (void* const*)&original_wordexp },
@@ -1001,25 +1100,54 @@ static const shdw_sandbox_sym_policy_entry_t shdw_sandbox_sym_policy_table[] = {
     { "__signal_nobind", (void*)&replaced___signal_nobind, (void* const*)&original___signal_nobind },
 };
 
+// Sorted index over the table, built on first use: dlsym policy lookups miss
+// for every ordinary symbol and scanned the whole table linearly.
+#define SHDW_SANDBOX_SYM_COUNT (sizeof(shdw_sandbox_sym_policy_table) / sizeof(shdw_sandbox_sym_policy_table[0]))
+
+static int shdw_sandbox_sym_compare(const void* a, const void* b) {
+    const shdw_sandbox_sym_policy_entry_t* ra = *(const shdw_sandbox_sym_policy_entry_t* const*)a;
+    const shdw_sandbox_sym_policy_entry_t* rb = *(const shdw_sandbox_sym_policy_entry_t* const*)b;
+    return strcmp(ra->name, rb->name);
+}
+
+static const shdw_sandbox_sym_policy_entry_t* shdw_sandbox_sym_sorted[SHDW_SANDBOX_SYM_COUNT];
+static dispatch_once_t shdw_sandbox_sym_sort_once;
+
+static void shdw_sandbox_sym_sort(void* unused) {
+    (void)unused;
+
+    for(size_t i = 0; i < SHDW_SANDBOX_SYM_COUNT; i++) {
+        shdw_sandbox_sym_sorted[i] = &shdw_sandbox_sym_policy_table[i];
+    }
+
+    qsort(shdw_sandbox_sym_sorted, SHDW_SANDBOX_SYM_COUNT, sizeof(shdw_sandbox_sym_sorted[0]), shdw_sandbox_sym_compare);
+}
+
 void* shdw_sym_policy_lookup_sandbox(const char* name) {
     if(!name) {
         return NULL;
     }
 
-    for(size_t i = 0; i < sizeof(shdw_sandbox_sym_policy_table) / sizeof(shdw_sandbox_sym_policy_table[0]); i++) {
-        if(strcmp(name, shdw_sandbox_sym_policy_table[i].name) == 0) {
-            if(shdw_sandbox_sym_policy_table[i].original && *shdw_sandbox_sym_policy_table[i].original == NULL) {
-                // Some adapters resolve fork with dlsym(RTLD_DEFAULT). Keep
-                // that route covered even when its tiny entrypoint cannot be
-                // patched and the app has no fork import to rebind.
-                if(strcmp(name, "fork") != 0 || !resolved_fork) {
-                    return NULL;  // runtime-resolved symbol not installed
-                }
-            }
+    dispatch_once_f(&shdw_sandbox_sym_sort_once, NULL, shdw_sandbox_sym_sort);
 
-            return shdw_sandbox_sym_policy_table[i].replacement;
+    shdw_sandbox_sym_policy_entry_t key = { name, NULL, NULL };
+    const shdw_sandbox_sym_policy_entry_t* keyp = &key;
+    const shdw_sandbox_sym_policy_entry_t** hit = bsearch(&keyp, shdw_sandbox_sym_sorted, SHDW_SANDBOX_SYM_COUNT, sizeof(shdw_sandbox_sym_sorted[0]), shdw_sandbox_sym_compare);
+
+    if(!hit) {
+        return NULL;
+    }
+
+    const shdw_sandbox_sym_policy_entry_t* d = *hit;
+
+    if(d->original && *d->original == NULL) {
+        // Some adapters resolve fork with dlsym(RTLD_DEFAULT). Keep
+        // that route covered even when its tiny entrypoint cannot be
+        // patched and the app has no fork import to rebind.
+        if(strcmp(name, "fork") != 0 || !resolved_fork) {
+            return NULL;  // runtime-resolved symbol not installed
         }
     }
 
-    return NULL;
+    return d->replacement;
 }

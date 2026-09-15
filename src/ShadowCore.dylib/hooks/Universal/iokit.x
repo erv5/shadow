@@ -360,20 +360,49 @@ static const shdw_iokit_sym_policy_entry_t shdw_iokit_sym_policy_table[] = {
     { "IOServiceAddMatchingNotification", (void*)&replaced_IOServiceAddMatchingNotification, (void* const*)&original_IOServiceAddMatchingNotification },
 };
 
+// Sorted index over the table, built on first use: dlsym policy lookups miss
+// for every ordinary symbol and scanned the whole table linearly.
+#define SHDW_IOKIT_SYM_COUNT (sizeof(shdw_iokit_sym_policy_table) / sizeof(shdw_iokit_sym_policy_table[0]))
+
+static int shdw_iokit_sym_compare(const void* a, const void* b) {
+    const shdw_iokit_sym_policy_entry_t* ra = *(const shdw_iokit_sym_policy_entry_t* const*)a;
+    const shdw_iokit_sym_policy_entry_t* rb = *(const shdw_iokit_sym_policy_entry_t* const*)b;
+    return strcmp(ra->name, rb->name);
+}
+
+static const shdw_iokit_sym_policy_entry_t* shdw_iokit_sym_sorted[SHDW_IOKIT_SYM_COUNT];
+static dispatch_once_t shdw_iokit_sym_sort_once;
+
+static void shdw_iokit_sym_sort(void* unused) {
+    (void)unused;
+
+    for(size_t i = 0; i < SHDW_IOKIT_SYM_COUNT; i++) {
+        shdw_iokit_sym_sorted[i] = &shdw_iokit_sym_policy_table[i];
+    }
+
+    qsort(shdw_iokit_sym_sorted, SHDW_IOKIT_SYM_COUNT, sizeof(shdw_iokit_sym_sorted[0]), shdw_iokit_sym_compare);
+}
+
 void* shdw_sym_policy_lookup_iokit(const char* name) {
     if(!name) {
         return NULL;
     }
 
-    for(size_t i = 0; i < sizeof(shdw_iokit_sym_policy_table) / sizeof(shdw_iokit_sym_policy_table[0]); i++) {
-        if(strcmp(name, shdw_iokit_sym_policy_table[i].name) == 0) {
-            if(shdw_iokit_sym_policy_table[i].original && *shdw_iokit_sym_policy_table[i].original == NULL) {
-                return NULL;  // runtime-resolved symbol not installed
-            }
+    dispatch_once_f(&shdw_iokit_sym_sort_once, NULL, shdw_iokit_sym_sort);
 
-            return shdw_iokit_sym_policy_table[i].replacement;
-        }
+    shdw_iokit_sym_policy_entry_t key = { name, NULL, NULL };
+    const shdw_iokit_sym_policy_entry_t* keyp = &key;
+    const shdw_iokit_sym_policy_entry_t** hit = bsearch(&keyp, shdw_iokit_sym_sorted, SHDW_IOKIT_SYM_COUNT, sizeof(shdw_iokit_sym_sorted[0]), shdw_iokit_sym_compare);
+
+    if(!hit) {
+        return NULL;
     }
 
-    return NULL;
+    const shdw_iokit_sym_policy_entry_t* d = *hit;
+
+    if(d->original && *d->original == NULL) {
+        return NULL;  // runtime-resolved symbol not installed
+    }
+
+    return d->replacement;
 }

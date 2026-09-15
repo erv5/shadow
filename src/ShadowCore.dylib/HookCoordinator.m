@@ -2,6 +2,8 @@
 
 #import <Shadow/Core.h>
 
+#import "hooks/hooks.h"
+
 #import <dlfcn.h>
 #import <errno.h>
 #import <mach-o/dyld.h>
@@ -449,6 +451,11 @@ static NSDictionary<NSString*, id>* shdw_identity_image_for_address(const void* 
         // work reverted first, so the escalation builds on intact hooks.
         // Pure memory compare/store — safe on either queue.
         SHDWRebindRepairSlots();
+
+        // Deferred large-image svc scans (svc_patch.x): escalation is the
+        // moment that coverage matters; apps that never trip a detector keep
+        // the fast launch, and the scan runs here on the lifecycle queue.
+        shdw_svc_patch_deferred();
     }
     NSArray<NSString*>* plan = SHDWPluginPlan(self.prefs, self.backends.capabilities, event);
 

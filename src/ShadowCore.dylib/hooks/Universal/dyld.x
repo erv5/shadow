@@ -70,6 +70,20 @@ static struct dyld_uuid_info* _shdw_dyld_uuid_buffers[2] = {NULL, NULL};
 static struct dyld_uuid_info* _shdw_dyld_uuid_published = NULL;
 static NSMutableArray* _shdw_dyld_path_pool = nil;
 
+// Parallel precomputed entries for the mirror rebuild: an image's mtime (one
+// stat) and UUID (one load-command walk) are constants for the process, but
+// the rebuild used to recompute both for EVERY image on EVERY add/remove —
+// hundreds of thousands of stat() syscalls across an image-heavy launch.
+// Compute once here at add time; rebuilds then fill the published buffers
+// with plain memcpys. Mutated under _shdw_dyld_mirror_lock.
+static struct dyld_image_info _shdw_dyld_info_entries[SHADOW_DYLD_MIRROR_CAPACITY];
+static intptr_t _shdw_dyld_slide_entries[SHADOW_DYLD_MIRROR_CAPACITY];
+static struct dyld_uuid_info _shdw_dyld_uuid_entries[SHADOW_DYLD_MIRROR_CAPACITY];
+static uint32_t _shdw_dyld_entry_count = 0;
+static uint32_t _shdw_dyld_uuid_entry_count = 0;
+
+static BOOL shdw_dyld_image_uuid(const struct mach_header* mh, uuid_t uuid);
+
 // Ceiling for the fixed-slot private ObjC notifier registries below.  Public
 // _dyld_register_func_for_{add,remove}_image registrations deliberately use
 // NSMutableArray instead: dyld's public API has no eight-callback ceiling.
@@ -1114,6 +1128,36 @@ void shdw_universal_dyld_updatelibs(const struct mach_header* mh, intptr_t vmadd
                 [_shdw_dyld_path_pool addObject:path];
             }
 
+            // Precompute the mirror entry once (per-image constants): real
+            // mtime via stat — Shadow-internal, so the hooked stat passes
+            // through — and the image UUID. Rebuilds memcpy these arrays
+            // instead of re-statting and re-parsing every image per event.
+            pthread_mutex_lock(&_shdw_dyld_mirror_lock);
+
+            if(_shdw_dyld_entry_count < SHADOW_DYLD_MIRROR_CAPACITY) {
+                uint32_t idx = _shdw_dyld_entry_count++;
+                struct dyld_image_info* info = &_shdw_dyld_info_entries[idx];
+
+                info->imageLoadAddress = mh;
+                info->imageFilePath = [path UTF8String];
+
+                struct stat st;
+                info->imageFileModDate = stat([path fileSystemRepresentation], &st) == 0
+                    ? (uintptr_t) st.st_mtimespec.tv_sec : 0;
+
+                _shdw_dyld_slide_entries[idx] = vmaddr_slide;
+
+                uuid_t uuid;
+                if(shdw_dyld_image_uuid(mh, uuid)
+                   && _shdw_dyld_uuid_entry_count < SHADOW_DYLD_MIRROR_CAPACITY) {
+                    _shdw_dyld_uuid_entries[_shdw_dyld_uuid_entry_count].imageLoadAddress = mh;
+                    memcpy(_shdw_dyld_uuid_entries[_shdw_dyld_uuid_entry_count].imageUUID, uuid, sizeof(uuid_t));
+                    _shdw_dyld_uuid_entry_count++;
+                }
+            }
+
+            pthread_mutex_unlock(&_shdw_dyld_mirror_lock);
+
             // Keep dyld_all_image_infos filtered arrays in sync. Deferred
             // during the add-image replay at install — one rebuild after
             // registration covers the whole collection.
@@ -1196,6 +1240,29 @@ void shdw_universal_dyld_updatelibs_r(const struct mach_header* mh, intptr_t vma
             NSLog(@"%@: %@: %@", @"dyld", @"removing lib", dylibToRemove[@"name"]);
         }
         [_shdw_dyld_collection removeObject:dylibToRemove];
+
+        pthread_mutex_lock(&_shdw_dyld_mirror_lock);
+
+        for(uint32_t i = 0; i < _shdw_dyld_entry_count; i++) {
+            if(_shdw_dyld_info_entries[i].imageLoadAddress == mh) {
+                size_t tail = _shdw_dyld_entry_count - i - 1;
+                memmove(&_shdw_dyld_info_entries[i], &_shdw_dyld_info_entries[i + 1], tail * sizeof(struct dyld_image_info));
+                memmove(&_shdw_dyld_slide_entries[i], &_shdw_dyld_slide_entries[i + 1], tail * sizeof(intptr_t));
+                _shdw_dyld_entry_count--;
+                break;
+            }
+        }
+
+        for(uint32_t i = 0; i < _shdw_dyld_uuid_entry_count; i++) {
+            if(_shdw_dyld_uuid_entries[i].imageLoadAddress == mh) {
+                memmove(&_shdw_dyld_uuid_entries[i], &_shdw_dyld_uuid_entries[i + 1],
+                        (_shdw_dyld_uuid_entry_count - i - 1) * sizeof(struct dyld_uuid_info));
+                _shdw_dyld_uuid_entry_count--;
+                break;
+            }
+        }
+
+        pthread_mutex_unlock(&_shdw_dyld_mirror_lock);
 
         // Keep dyld_all_image_infos filtered arrays in sync.
         shadowhook_dyld_rebuild_dyldinfo();
@@ -1639,10 +1706,11 @@ static void* shdw_cfbundle_attributed(void* addr, CFStringRef symbolName) {
         char name[256];
 
         if(CFStringGetCString(symbolName, name, sizeof(name), kCFStringEncodingUTF8)) {
-            for(size_t i = 0; i < SHADOW_SYM_POLICY_COUNT; i++) {
-                if(strcmp(name, shdw_sym_policy_table[i].name) == 0) {
-                    return shdw_sym_policy_table[i].replacement;
-                }
+            shdw_sym_policy_entry_t key = { name, NULL };
+            shdw_sym_policy_entry_t* entry = bsearch(&key, shdw_sym_policy_table, SHADOW_SYM_POLICY_COUNT, sizeof(shdw_sym_policy_entry_t), shdw_sym_policy_compare);
+
+            if(entry) {
+                return entry->replacement;
             }
 
             // Same per-file fallback as replaced_dlsym: fishhook-rebound
@@ -2364,14 +2432,16 @@ static void shadowhook_dyld_rebuild_dyldinfo(void) {
     if(!snapshotAllocFailed) {
         shdw_dyld_snapshot_t* snapshot = (_shdw_dyld_snapshot == _shdw_dyld_snapshot_buffers[1]) ? _shdw_dyld_snapshot_buffers[0] : _shdw_dyld_snapshot_buffers[1];
 
-        snapshot->count = (uint32_t) count;
+        // Fill from the precomputed parallel arrays (plain field copies — the
+        // per-image stat/UUID work happened once at add time).
+        uint32_t n = _shdw_dyld_entry_count;
+        if(n > (uint32_t) count) n = (uint32_t) count;
+        snapshot->count = n;
 
-        for(NSUInteger i = 0; i < count; i++) {
-            NSDictionary* dylib = _dyld_collection[i];
-
-            snapshot->entry[i].mh = (struct mach_header *)[dylib[@"mach_header"] pointerValue];
-            snapshot->entry[i].slide = (intptr_t)[dylib[@"slide"] pointerValue];
-            snapshot->entry[i].name = [dylib[@"name"] UTF8String];
+        for(uint32_t i = 0; i < n; i++) {
+            snapshot->entry[i].mh = (struct mach_header*) _shdw_dyld_info_entries[i].imageLoadAddress;
+            snapshot->entry[i].slide = _shdw_dyld_slide_entries[i];
+            snapshot->entry[i].name = _shdw_dyld_info_entries[i].imageFilePath;
         }
 
         __atomic_store_n(&_shdw_dyld_snapshot, snapshot, __ATOMIC_RELEASE);
@@ -2467,41 +2537,19 @@ static void shadowhook_dyld_rebuild_dyldinfo(void) {
         struct dyld_image_info* infoGen = (_shdw_dyld_info_published == _shdw_dyld_info_buffers[1]) ? _shdw_dyld_info_buffers[0] : _shdw_dyld_info_buffers[1];
         struct dyld_uuid_info* uuidGen = (_shdw_dyld_uuid_published == _shdw_dyld_uuid_buffers[1]) ? _shdw_dyld_uuid_buffers[0] : _shdw_dyld_uuid_buffers[1];
 
-        // Filtered dyld_image_info array, one entry per collection entry.
-        for(NSUInteger i = 0; i < count; i++) {
-            NSDictionary* dylib = _dyld_collection[i];
+        // Filtered dyld_image_info array, one entry per parallel-array entry
+        // (mtime was computed once at add time — a synthetic 0 would be a
+        // fingerprint for raw readers cross-checking imageFilePath against
+        // stat(), so the real value is kept, just not re-fetched per event).
+        uint32_t infoCount = _shdw_dyld_entry_count;
+        if(infoCount > (uint32_t) count) infoCount = (uint32_t) count;
+        memcpy(infoGen, _shdw_dyld_info_entries, infoCount * sizeof(struct dyld_image_info));
 
-            infoGen[i].imageLoadAddress = (struct mach_header *)[dylib[@"mach_header"] pointerValue];
-            infoGen[i].imageFilePath = [dylib[@"name"] UTF8String];
-
-            // Real mtime from the file: a synthetic 0 is a fingerprint for a
-            // raw reader cross-checking imageFilePath against stat(). The
-            // stat call originates from Shadow-owned code, so the hooked
-            // stat classifies it internal and passes through.
-            struct stat st;
-
-            if(stat([dylib[@"name"] fileSystemRepresentation], &st) == 0) {
-                infoGen[i].imageFileModDate = st.st_mtimespec.tv_sec;
-            } else {
-                infoGen[i].imageFileModDate = 0;
-            }
-        }
-
-        // Build the filtered UUID table from the visible, non-shared-cache
-        // images. dyld mutates its live UUID table while this mirror owns the
-        // public pointer, so rescanning that table can omit a fresh dlopen.
-        NSUInteger uuidCount = 0;
-
-        for(NSUInteger i = 0; i < count; i++) {
-            const struct mach_header* mh = (struct mach_header *)[_dyld_collection[i][@"mach_header"] pointerValue];
-            uuid_t uuid;
-
-            if(shdw_dyld_image_uuid(mh, uuid)) {
-                uuidGen[uuidCount].imageLoadAddress = mh;
-                memcpy(uuidGen[uuidCount].imageUUID, uuid, sizeof(uuid_t));
-                uuidCount++;
-            }
-        }
+        // Filtered UUID table, precomputed at add time. dyld mutates its live
+        // UUID table while this mirror owns the public pointer, so the real
+        // table is never the source here.
+        NSUInteger uuidCount = _shdw_dyld_uuid_entry_count;
+        memcpy(uuidGen, _shdw_dyld_uuid_entries, uuidCount * sizeof(struct dyld_uuid_info));
 
         // Publish into dyld's live struct (plain, non-PAC-signed pointers). The
         // page may be read-only: make it writable via vm_protect, write only
@@ -2527,7 +2575,7 @@ static void shadowhook_dyld_rebuild_dyldinfo(void) {
             // Count first, pointer last: a reader catching the swap sees the
             // new count with the previous generation's entries — stale but
             // within the fixed capacity — never a torn or over-read buffer.
-            _shdw_all_image_infos->infoArrayCount = (uint32_t) count;
+            _shdw_all_image_infos->infoArrayCount = (uint32_t) infoCount;
             _shdw_all_image_infos->infoArray = infoGen;
             _shdw_dyld_info_published = infoGen;
 

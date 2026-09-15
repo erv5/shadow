@@ -30,6 +30,12 @@ BOOL shdw_memory_hiding_enabled = YES;
 // check result rather than only shaping a stock-looking environment.
 BOOL shdw_detector_aggressive = NO;
 
+// NO when HK_Library pins a non-ellekit backend for this app: the brk lane is
+// unused then, and ElleKit's task-wide exception handler only adds its fatal
+// altstack guard on top of the app's own RASP handling. Read by the sandbox
+// task_set_exception_ports hook to suppress the handler's registration.
+BOOL shdw_ellekit_lane = YES;
+
 static BOOL _shdw_watcher_enabled = NO;
 static BOOL _shdw_uikit_installed = NO;
 static SHDWHookCoordinator* shdw_coordinator_instance = nil;
@@ -176,8 +182,21 @@ static void shdw_coordinator_ctor(NSDictionary<NSString*, id>* prefs) {
     // can fire. Pre-initialize it here so those hooks are handled instead of
     // trapping (observed: EXC_BREAKPOINT SIGTRAP during the dyld unit's
     // install when isPathRestricted re-enters a brk-patched function).
+    //
+    // Skipped when HK_Library pins a non-ellekit backend for this app: the brk
+    // lane is then unused, and ElleKit's task-wide altstack handler only adds
+    // its "stack overflow blocked" kill path on top of the app's own RASP
+    // exception handling (observed: Starling exits via that guard ~18s in,
+    // regardless of what Shadow itself hooks).
+    id hookLib = prefs[@"HK_Library"];
+    BOOL ellekitLane = ![hookLib isKindOfClass:[NSString class]]
+        || [(NSString*)hookLib isEqualToString:@"auto"]
+        || [(NSString*)hookLib isEqualToString:@"ellekit"]
+        || [(NSString*)hookLib length] == 0;
+    shdw_ellekit_lane = ellekitLane;
+
     void* ekLaunch = dlsym(RTLD_DEFAULT, "EKLaunchExceptionHandler");
-    if(ekLaunch) {
+    if(ekLaunch && ellekitLane) {
         ((mach_port_t (*)(void))ekLaunch)();
     }
 

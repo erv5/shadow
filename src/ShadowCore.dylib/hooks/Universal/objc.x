@@ -139,16 +139,43 @@ static BOOL shdw_path_is_main_image(const char* path) {
 // objc_copyImageNames, objc_copyClassNamesForImage, objc_copyClassesForImage):
 // the host app's own image always resolves; Shadow artifacts and other
 // protected images stay hidden.
+//
+// Per-image verdict memo, tagged by ruleset generation: a class's verdict is a
+// function of its image path, and objc_getClassList walks tens of thousands of
+// classes sharing a few hundred images. Without the memo each class pays a
+// main-image stat probe plus a full engine query — a dominant startup cost in
+// class-heavy apps.
 BOOL shdw_objc_image_path_is_hidden(const char* path) {
     if(!path || !path[0]) {
         return NO;
     }
 
-    if(shdw_path_is_main_image(path)) {
-        return NO;
+    static NSCache* memo = nil;
+    static dispatch_once_t memoOnce;
+    dispatch_once(&memoOnce, ^{
+        memo = [NSCache new];
+        memo.countLimit = 1024;
+    });
+
+    uint64_t gen = atomic_load_explicit(&shdw_ruleset_generation, memory_order_acquire);
+    NSString* key = [NSString stringWithUTF8String:path];
+
+    NSNumber* packed = [memo objectForKey:key];
+    if(packed) {
+        uint64_t v = [packed unsignedLongLongValue];
+        if((v >> 1) == gen) {
+            return (BOOL)(v & 1);
+        }
     }
 
-    return shdw_is_shadow_runtime_image(path) || [_shadow isProtectedImagePath:@(path)];
+    BOOL hidden = NO;
+
+    if(!shdw_path_is_main_image(path)) {
+        hidden = shdw_is_shadow_runtime_image(path) || [_shadow isProtectedImagePath:key];
+    }
+
+    [memo setObject:@((gen << 1) | (uint64_t)(hidden ? 1 : 0)) forKey:key];
+    return hidden;
 }
 
 // Class-object hiding: classify by the class's EXACT image path, never by
@@ -166,32 +193,68 @@ BOOL shdw_objc_class_is_hidden(Class cls) {
         return NO;
     }
 
+    // Per-class verdict memo (pointer-keyed, ruleset-generation tagged):
+    // class-list scans classify tens of thousands of classes that share a few
+    // hundred images; without it, each class pays an image-name resolve plus
+    // path classification, and big apps' repeated objc_getClassList scans were
+    // stalling startup past the scene-update watchdog.
+    static NSCache* classMemo = nil;
+    static dispatch_once_t classMemoOnce;
+    dispatch_once(&classMemoOnce, ^{
+        classMemo = [NSCache new];
+        classMemo.countLimit = 8192;
+    });
+
+    uint64_t gen = atomic_load_explicit(&shdw_ruleset_generation, memory_order_acquire);
+    NSValue* key = [NSValue valueWithPointer:(__bridge const void*)cls];
+
+    NSNumber* packed = [classMemo objectForKey:key];
+    if(packed) {
+        uint64_t v = [packed unsignedLongLongValue];
+        if((v >> 1) == gen) {
+            return (BOOL)(v & 1);
+        }
+    }
+
     const void* addr = (__bridge const void *)cls;
 
     if(shdw_addr_in_main_image(addr)) {
+        [classMemo setObject:@((gen << 1)) forKey:key];
         return NO;
     }
 
     uintptr_t a = (uintptr_t)addr;
     shdw_own_ranges_t* own = __atomic_load_n(&_shdw_own_ranges_published, __ATOMIC_ACQUIRE);
 
+    BOOL ownRange = NO;
+
     for(uint32_t i = 0; i < own->count; i++) {
         if(a >= own->range[i].base && a < own->range[i].end) {
-            return YES;
+            ownRange = YES;
+            break;
         }
     }
 
+    if(ownRange) {
+        [classMemo setObject:@((gen << 1) | 1) forKey:key];
+        return YES;
+    }
+
     if(!original_class_getImageName) {
+        [classMemo setObject:@((gen << 1)) forKey:key];
         return NO;   // no native resolver → fail visible
     }
 
     const char* image = original_class_getImageName(cls);
 
     if(!image || !image[0]) {
+        [classMemo setObject:@((gen << 1)) forKey:key];
         return NO;   // runtime-native class (no loadable image) → visible
     }
 
-    return shdw_objc_image_path_is_hidden(image);
+    BOOL hidden = shdw_objc_image_path_is_hidden(image);
+    [classMemo setObject:@((gen << 1) | (uint64_t)(hidden ? 1 : 0)) forKey:key];
+    return hidden;
 }
 
 

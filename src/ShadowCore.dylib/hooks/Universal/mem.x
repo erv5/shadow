@@ -223,20 +223,49 @@ static const shdw_mem_sym_policy_entry_t shdw_mem_sym_policy_table[] = {
     { "vm_read_overwrite", (void*)&replaced_vm_read_overwrite, (void* const*)&original_vm_read_overwrite },
 };
 
+// Sorted index over the table, built on first use: dlsym policy lookups miss
+// for every ordinary symbol and scanned the whole table linearly.
+#define SHDW_MEM_SYM_COUNT (sizeof(shdw_mem_sym_policy_table) / sizeof(shdw_mem_sym_policy_table[0]))
+
+static int shdw_mem_sym_compare(const void* a, const void* b) {
+    const shdw_mem_sym_policy_entry_t* ra = *(const shdw_mem_sym_policy_entry_t* const*)a;
+    const shdw_mem_sym_policy_entry_t* rb = *(const shdw_mem_sym_policy_entry_t* const*)b;
+    return strcmp(ra->name, rb->name);
+}
+
+static const shdw_mem_sym_policy_entry_t* shdw_mem_sym_sorted[SHDW_MEM_SYM_COUNT];
+static dispatch_once_t shdw_mem_sym_sort_once;
+
+static void shdw_mem_sym_sort(void* unused) {
+    (void)unused;
+
+    for(size_t i = 0; i < SHDW_MEM_SYM_COUNT; i++) {
+        shdw_mem_sym_sorted[i] = &shdw_mem_sym_policy_table[i];
+    }
+
+    qsort(shdw_mem_sym_sorted, SHDW_MEM_SYM_COUNT, sizeof(shdw_mem_sym_sorted[0]), shdw_mem_sym_compare);
+}
+
 void* shdw_sym_policy_lookup_mem(const char* name) {
     if(!name) {
         return NULL;
     }
 
-    for(size_t i = 0; i < sizeof(shdw_mem_sym_policy_table) / sizeof(shdw_mem_sym_policy_table[0]); i++) {
-        if(strcmp(name, shdw_mem_sym_policy_table[i].name) == 0) {
-            if(shdw_mem_sym_policy_table[i].original && *shdw_mem_sym_policy_table[i].original == NULL) {
-                return NULL;  // symbol not installed
-            }
+    dispatch_once_f(&shdw_mem_sym_sort_once, NULL, shdw_mem_sym_sort);
 
-            return shdw_mem_sym_policy_table[i].replacement;
-        }
+    shdw_mem_sym_policy_entry_t key = { name, NULL, NULL };
+    const shdw_mem_sym_policy_entry_t* keyp = &key;
+    const shdw_mem_sym_policy_entry_t** hit = bsearch(&keyp, shdw_mem_sym_sorted, SHDW_MEM_SYM_COUNT, sizeof(shdw_mem_sym_sorted[0]), shdw_mem_sym_compare);
+
+    if(!hit) {
+        return NULL;
     }
 
-    return NULL;
+    const shdw_mem_sym_policy_entry_t* d = *hit;
+
+    if(d->original && *d->original == NULL) {
+        return NULL;  // symbol not installed
+    }
+
+    return d->replacement;
 }
