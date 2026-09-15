@@ -895,6 +895,16 @@ void shdw_svc_patch_install(void) {
     shdw_svc_own_image = (const struct mach_header*)info.dli_fbase;
     installed = YES;
     _dyld_register_func_for_add_image(shdw_svc_image_add);
+
+    // The registration replay queued every already-loaded image; patch them
+    // now, synchronously, before returning. The app's linked frameworks were
+    // all mapped before Shadow's initializer ran, so this one drain leaves no
+    // window where a detector constructor can observe its own svc sites
+    // unpatched: the trailing debounce only goes quiet 50ms after the last
+    // record, but dyld starts running initializers immediately after the last
+    // map, and a BShield-class consistency probe in a constructor verdicts on
+    // the spot (observed: MyViettel error 3 with the async-only path).
+    shdw_svc_patch_deferred();
 }
 
 #else   // !__arm64__
