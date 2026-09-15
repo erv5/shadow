@@ -26,6 +26,12 @@
 	return [[NSBundle bundleForClass:[self class]] localizedStringForKey:key value:fallback table:@"Root"];
 }
 
+- (NSString *)rootVersionLine:(id)sender {
+	// Root-pane identity: fork + installed version, visible without opening About.
+	NSString* version = SHDWInstalledVersion();
+	return version.length ? [version stringByAppendingString:@" (erv5 fork)"] : @"erv5 fork of jjolano/shadow";
+}
+
 - (id)readPreferenceValue:(PSSpecifier *)specifier {
 	NSString* key = [specifier identifier];
 

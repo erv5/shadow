@@ -97,6 +97,18 @@
 			<key>label</key>
 			<string>ROOT_ABOUT</string>
 		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSTitleValueCell</string>
+			<key>get</key>
+			<string>rootVersionLine:</string>
+			<key>label</key>
+			<string>VERSION</string>
+		</dict>
 	</array>
 	<key>title</key>
 	<string>Shadow</string>
