@@ -15,3 +15,13 @@
 "ROOT_ABOUT" = "About";
 
 "VERSION" = "Version";
+
+"BACKUP_RESTORE" = "Backup & Restore";
+"BACKUP_RESTORE_DESC" = "Export your Shadow + Choicy config to a file, or restore it on another device.";
+"EXPORT_CONFIG" = "Export Config";
+"IMPORT_CONFIG" = "Import Config";
+
+"BACKUP_RESTORE" = "Backup & Restore";
+"BACKUP_RESTORE_DESC" = "Export your Shadow + Choicy config to a file, or restore it on another device.";
+"EXPORT_CONFIG" = "Export Config";
+"IMPORT_CONFIG" = "Import Config";

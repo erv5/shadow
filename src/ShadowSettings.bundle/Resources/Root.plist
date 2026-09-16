@@ -100,6 +100,30 @@
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>BACKUP_RESTORE_DESC</string>
+			<key>label</key>
+			<string>BACKUP_RESTORE</string>
+		</dict>
+		<dict>
+			<key>action</key>
+			<string>exportConfig:</string>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>EXPORT_CONFIG</string>
+		</dict>
+		<dict>
+			<key>action</key>
+			<string>importConfig:</string>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>IMPORT_CONFIG</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
 		</dict>
 		<dict>
 			<key>cell</key>

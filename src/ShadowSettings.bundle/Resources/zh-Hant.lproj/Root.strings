@@ -33,3 +33,8 @@
 "APPS_EXCLUDED_FMT" = "所有應用程式已啟用 · %ld 個已排除";
 
 "VERSION" = "版本";
+
+"BACKUP_RESTORE" = "備份與還原";
+"BACKUP_RESTORE_DESC" = "將 Shadow 與 Choicy 設定輸出到檔案，或在另一台裝置上還原。";
+"EXPORT_CONFIG" = "輸出設定";
+"IMPORT_CONFIG" = "輸入設定";

@@ -4,6 +4,7 @@
 #import <Shadow/Core+Utilities.h>
 #import <Shadow/Settings.h>
 #import <Shadow/HookConfiguration.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 @implementation SHDWRootListController {
 	NSUserDefaults* prefs;
@@ -86,5 +87,108 @@
 	}
 
 	return self;
+}
+
+// --- Backup & Restore -------------------------------------------------------
+
+- (NSString *)shdwPrefsPath {
+	// me.jjolano.shadow.plist (resolves through the rootless jbroot symlink)
+	return @"/var/mobile/Library/Preferences/me.jjolano.shadow.plist";
+}
+
+- (NSString *)choicyPrefsPath {
+	// Choicy's per-app tweak lists live in the same preferences dir.
+	NSArray* candidates = @[
+		@"/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist",
+		@"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist",
+	];
+	for(NSString* path in candidates) {
+		if([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+			return path;
+		}
+	}
+	return candidates[0];
+}
+
+- (NSDictionary *)shdwExportBundle {
+	NSMutableDictionary* bundle = [NSMutableDictionary new];
+	bundle[@"format"] = @"shadow-backup";
+	bundle[@"version"] = @(1);
+	bundle[@"date"] = [[NSDate date] description];
+
+	NSDictionary* shadow = [NSDictionary dictionaryWithContentsOfFile:[self shdwPrefsPath]];
+	if(shadow) bundle[@"me.jjolano.shadow"] = shadow;
+
+	NSDictionary* choicy = [NSDictionary dictionaryWithContentsOfFile:[self choicyPrefsPath]];
+	if(choicy) bundle[@"com.opa334.choicyprefs"] = choicy;
+
+	return bundle;
+}
+
+- (IBAction)exportConfig:(id)sender {
+	NSDictionary* bundle = [self shdwExportBundle];
+	NSString* outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"shadow-config.plist"];
+	if(![bundle writeToFile:outPath atomically:YES]) {
+		[self shdwShowAlert:@"Export Failed" message:@"Could not write the backup file."];
+		return;
+	}
+
+	UIActivityViewController* share = [[UIActivityViewController alloc]
+		initWithActivityItems:@[[NSURL fileURLWithPath:outPath]] applicationActivities:nil];
+	[self presentViewController:share animated:YES completion:nil];
+}
+
+- (IBAction)importConfig:(id)sender {
+	UIDocumentPickerViewController* picker = [[UIDocumentPickerViewController alloc]
+		initForOpeningContentTypes:@[[UTType typeWithIdentifier:@"public.plist"], [UTType typeWithIdentifier:@"public.data"]] asCopy:YES];
+	picker.delegate = self;
+	picker.allowsMultipleSelection = NO;
+	[self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocuments:(NSArray<NSURL *> *)urls {
+	NSURL* url = urls.firstObject;
+	if(!url) return;
+
+	BOOL secure = [url startAccessingSecurityScopedResource];
+	NSDictionary* bundle = [NSDictionary dictionaryWithContentsOfFile:[url path]];
+	if(secure) [url stopAccessingSecurityScopedResource];
+
+	BOOL importedShadow = NO, importedChoicy = NO;
+
+	if([bundle[@"me.jjolano.shadow"] isKindOfClass:[NSDictionary class]]) {
+		importedShadow = [bundle[@"me.jjolano.shadow"] writeToFile:[self shdwPrefsPath] atomically:YES];
+	}
+	if([bundle[@"com.opa334.choicyprefs"] isKindOfClass:[NSDictionary class]]) {
+		importedChoicy = [bundle[@"com.opa334.choicyprefs"] writeToFile:[self choicyPrefsPath] atomically:YES];
+	}
+
+	// Fallback: a bare me.jjolano.shadow.plist (no wrapper) imports as the Shadow config.
+	if(!importedShadow && !importedChoicy && bundle && !bundle[@"format"]) {
+		importedShadow = [bundle writeToFile:[self shdwPrefsPath] atomically:YES];
+	}
+
+	if(!importedShadow && !importedChoicy) {
+		[self shdwShowAlert:@"Import Failed" message:@"That file is not a Shadow config backup."];
+		return;
+	}
+
+	// Tell ChoicySB to reload (it reads its plist file directly); Shadow prefs
+	// take effect on next app launch / respring.
+	CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+		CFSTR("com.opa334.choicyprefs/ReloadPrefs"), NULL, NULL, YES);
+
+	[self shdwShowAlert:@"Imported"
+		message:@"Config restored. Respring for everything to take effect."];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+}
+
+- (void)shdwShowAlert:(NSString *)title message:(NSString *)message {
+	UIAlertController* alert = [UIAlertController alertControllerWithTitle:title
+		message:message preferredStyle:UIAlertControllerStyleAlert];
+	[alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+	[self presentViewController:alert animated:YES completion:nil];
 }
 @end
