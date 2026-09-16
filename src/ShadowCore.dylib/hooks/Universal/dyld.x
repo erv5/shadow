@@ -516,9 +516,10 @@ void shdw_own_ranges_refresh(void) {
     for(uint32_t i = 0; i < count && rebuilt.count < SHADOW_OWN_IMAGE_MAX; i++) {
         const char* path = _dyld_get_image_name(i);
 
-        // Collect only exact installed Shadow images. The own spans are few
-        // and fixed once loaded; never use the broader image-hiding policy.
-        if(!path || !shdw_is_shadow_runtime_image(path)) {
+        // Collect Shadow's own installed images plus the jailbreak injection
+        // runtime (the loader must stay an internal caller or Shadow's own
+        // /var/jb hiding kills tweak enumeration mid-flight; see ranges.h).
+        if(!path || !(shdw_is_shadow_runtime_image(path) || shdw_is_trusted_loader_image(path))) {
             continue;
         }
 
@@ -558,7 +559,7 @@ void shdw_own_ranges_refresh(void) {
 // on every event (a ruleset reload has no image event of its own), but that is
 // two atomic loads.
 static void shdw_own_ranges_refresh_if_relevant(const char* path) {
-    if(path && !shdw_is_shadow_runtime_image(path)
+    if(path && !shdw_is_shadow_runtime_image(path) && !shdw_is_trusted_loader_image(path)
         && __atomic_load_n(&_shdw_restricted_ranges_published, __ATOMIC_ACQUIRE)->generation
             == atomic_load_explicit(&shdw_ruleset_generation, memory_order_acquire)) {
         return;

@@ -41,6 +41,44 @@ static inline int shdw_is_canonical_shadow_runtime_path(const char* path) {
     return 0;
 }
 
+// Trusted jailbreak injection-runtime images: the loader machinery that
+// enumerates and maps tweaks. Their file reads are operational, not detector
+// probes, and must see unfiltered results: once Shadow.dylib's hooks engage,
+// an external-classified loader loses its own view of the tweak directory
+// mid-enumeration, so every tweak that loads after Shadow (alphabetically
+// after "Shadow") never gets offered — observed on-device as MultiAccount's
+// rstweak never appearing in Shadow-enabled apps while working elsewhere.
+// Suffix-matched rather than exact-path: these are third-party images whose
+// absolute path varies by jailbreak flavor (rootful, rootless, procursus).
+// Trust is still address-keyed: only code executing inside those images is
+// believed, never app code, whatever an app names its own files.
+static inline int shdw_is_trusted_loader_image(const char* path) {
+    static const char* const suffixes[] = {
+        "/systemhook.dylib",
+        "/libinjector.dylib",
+        "/libellekit.dylib",
+        "/libroot.dylib",
+        "Choicy.dylib",     // the installed filename may carry leading spaces
+        NULL,
+    };
+
+    if(!path || !path[0]) {
+        return 0;
+    }
+
+    size_t plen = strlen(path);
+
+    for(unsigned int i = 0; suffixes[i]; i++) {
+        size_t slen = strlen(suffixes[i]);
+
+        if(plen >= slen && strcmp(path + plen - slen, suffixes[i]) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 // dyld reports rootless images through /var/jb's resolved physical root, not
 // necessarily through the /var/jb alias. Keep that form exact as well: the
 // caller supplies the one runtime-resolved root, and only package suffixes
