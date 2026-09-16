@@ -836,36 +836,6 @@ static void shdw_svc_image_add(const struct mach_header* mh, intptr_t slide) {
         return;
     }
 
-    // App-owned images patch synchronously, inline on dyld's load path.
-    // Detector frameworks are dlopen'd by app code AFTER Shadow's install
-    // (BShield arrives ~200ms in), so they miss the install-time drain, and
-    // the async queue's quiet window leaves their svc sites unpatched exactly
-    // when the first consistency probe runs (MyViettel error 3 despite the
-    // drain). The word scan runs unlocked and the stop-the-world window
-    // tracks site count, so the inline cost is a millisecond-scale scan per
-    // image. Non-app images (rare: everything system/procursus is skipped)
-    // keep the async queue.
-    for(uint32_t i = 0; i < _dyld_image_count(); i++) {
-        if(_dyld_get_image_header(i) == mh) {
-            const char* path = _dyld_get_image_name(i);
-
-            if(path && path[0] && !shdw_svc_skip_image(path)) {
-                NSString* imagePath = [NSString stringWithUTF8String:path];
-                NSString* bundlePath = [NSBundle mainBundle].bundlePath;
-                BOOL appOwned = [imagePath isEqualToString:bundlePath]
-                    || [imagePath hasPrefix:[bundlePath stringByAppendingString:@"/"]]
-                    || strstr(path, "/procursus/Applications/") != NULL;
-
-                if(appOwned) {
-                    shdw_svc_patch_image(mh, slide, path);
-                    return;
-                }
-            }
-
-            break;
-        }
-    }
-
     BOOL queued = NO;
 
     pthread_mutex_lock(&shdw_svc_queue_lock);
@@ -925,16 +895,6 @@ void shdw_svc_patch_install(void) {
     shdw_svc_own_image = (const struct mach_header*)info.dli_fbase;
     installed = YES;
     _dyld_register_func_for_add_image(shdw_svc_image_add);
-
-    // The registration replay queued every already-loaded image; patch them
-    // now, synchronously, before returning. The app's linked frameworks were
-    // all mapped before Shadow's initializer ran, so this one drain leaves no
-    // window where a detector constructor can observe its own svc sites
-    // unpatched: the trailing debounce only goes quiet 50ms after the last
-    // record, but dyld starts running initializers immediately after the last
-    // map, and a BShield-class consistency probe in a constructor verdicts on
-    // the spot (observed: MyViettel error 3 with the async-only path).
-    shdw_svc_patch_deferred();
 }
 
 #else   // !__arm64__
