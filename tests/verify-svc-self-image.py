@@ -70,6 +70,13 @@ prefix = r'''
    (its block/function argument never reaches the compiler). */
 #define dispatch_after(...) ((void)0)
 #define dispatch_after_f(...) ((void)0)
+#define dispatch_async(...) ((void)0)
+#define dispatch_get_global_queue(...) ((void*)0)
+#define QOS_CLASS_USER_INITIATED 0
+#define RTLD_DEFAULT ((void*)0)
+static void *dlsym(void *handle, const char *symbol) {
+    (void)handle; (void)symbol; return NULL;
+}
 
 typedef int BOOL;
 #define NO 0
@@ -82,6 +89,10 @@ typedef struct { const char *dli_fname; void *dli_fbase; } Dl_info;
 
 static const struct mach_header *shdw_svc_own_image = NULL;
 static _Atomic BOOL shdw_svc_sync_mode = NO;
+static _Atomic BOOL shdw_svc_pools_enabled = NO;
+static void (*shdw_svc_jit_wp)(int) = NULL;
+void shdw_svc_patch_pools(void) { }
+static void shdw_svc_pool_timer_start_once(void) { }
 static pthread_mutex_t shdw_svc_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static const struct mach_header *shdw_svc_queue[SHDW_SVC_QUEUE_MAX];
 static intptr_t shdw_svc_queue_slide[SHDW_SVC_QUEUE_MAX];

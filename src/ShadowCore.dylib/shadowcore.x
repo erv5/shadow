@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <objc/message.h>
 
 #import "../common.h"
 #import <Shadow/JBPath.h>
@@ -252,7 +253,8 @@ static void shdw_coordinator_ctor(NSDictionary<NSString*, id>* prefs) {
         shdw_adapter_devicecheck_configure(prefs);
         prefs = shdw_adapter_resolve_preferences(prefs);
         shdw_svc_patch_configure([prefs[SHDWUniversalSvcSyncID] boolValue],
-                                 [prefs[SHDWUniversalSvcExitVetoID] boolValue]);
+                                 [prefs[SHDWUniversalSvcExitVetoID] boolValue],
+                                 [prefs[SHDWUniversalSvcPoolsID] boolValue]);
         BOOL hasActiveDetectorAdapter = NO;
         for(NSString* key in @[ SHDWAdapterDTTJailbreakDetectionID, SHDWAdapterSafeDeviceID,
                                 SHDWAdapterJailMonkeyID ]) {
@@ -318,6 +320,36 @@ static void shdw_coordinator_ctor(NSDictionary<NSString*, id>* prefs) {
             }
         } @finally {
             [Shadow shdwExitInternalRead];
+        }
+
+        // Deferred tweak loads (Universal_DeferredLoad pref): some detectors
+        // (BShield-class) crash or trip when a tweak's initializer runs during
+        // their early bring-up window. Loading the same dylib a few seconds
+        // after launch — once the detector has settled — avoids the window
+        // entirely. The dlopen runs from ShadowCore (a trusted loader image),
+        // so the dyld-resolution filter passes it through.
+        NSArray* deferredLoads = prefs[SHDWUniversalDeferredLoadID];
+        if([deferredLoads isKindOfClass:[NSArray class]] && [deferredLoads count]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6LL * NSEC_PER_SEC),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                // Prime lazy detector state with genuine values before the
+                // deferred tweak's initializer can interpose identity getters.
+                @autoreleasepool {
+                    (void)[UIDevice currentDevice].identifierForVendor;
+                    Class asid = NSClassFromString(@"ASIdentifierManager");
+                    if(asid) {
+                        id mgr = ((id(*)(Class,SEL))objc_msgSend)((id)asid, NSSelectorFromString(@"sharedManager"));
+                        if(mgr) (void)((id(*)(id,SEL))objc_msgSend)(mgr, NSSelectorFromString(@"advertisingIdentifier"));
+                    }
+                }
+                for(id entry in deferredLoads) {
+                    if(![entry isKindOfClass:[NSString class]]) continue;
+                    NSString* path = (NSString*)entry;
+                    BOOL ok = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL) != NULL;
+                    NSLog(@"[Shadow] deferred load %@: %@", path, ok ? @"ok" : @"failed");
+                    (void)ok;
+                }
+            });
         }
     } @catch (NSException* e) {
         NSLog(@"[Shadow] constructor failed: %@ — continuing", e);

@@ -77,6 +77,22 @@
 // read from the app dict by ShadowCore at init.
 #define SHDWUniversalSvcExitVetoID @"Universal_SvcExitVeto"
 
+// Per-app JIT-pool coverage. When on for an app, anonymous private executable
+// regions (the MAP_JIT syscall-stub tables BShield-class detectors generate
+// at runtime) are swept for inline svc sites, and each site is redirected
+// through the svc trampoline — so a JIT'd probe gets the same path policy and
+// a JIT'd exit the same veto as an image-based one. Costs a periodic region
+// walk. Per-app only: read from the app dict by ShadowCore at init.
+#define SHDWUniversalSvcPoolsID    @"Universal_SvcPools"
+
+// Per-app deferred tweak loads. An array of dylib paths to dlopen six seconds
+// after launch, once detector bring-up has settled — for tweaks whose
+// initializers crash or trip a detector when they run inside the launch
+// window (rstweak-class identity spoofers against BShield-class RASP). The
+// load runs from ShadowCore (a trusted loader image). Per-app only: read
+// from the app dict by ShadowCore at init.
+#define SHDWUniversalDeferredLoadID @"Universal_DeferredLoad"
+
 // Resolve the effective aggressive-neutralization state for an app: the per-app
 // override if present, else the global default. Mirrors SHDWApplicationEnabled's
 // global-fallback shape.

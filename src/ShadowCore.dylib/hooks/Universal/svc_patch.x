@@ -787,6 +787,376 @@ static void shdw_svc_patch_image(const struct mach_header* mh, intptr_t slide, c
     }
 }
 
+// --- JIT-pool (anonymous executable region) coverage ------------------------
+// BShield-class detectors generate syscall stubs into MAP_JIT regions at
+// runtime; those sites live in no image's __TEXT, so the image scanner never
+// sees them — probes and the error-flow exit execute raw. With the per-app
+// Universal_SvcPools pref, sweep anonymous private executable regions for
+// inline svc sites and redirect each through the canonical trampoline, so a
+// JIT'd probe gets the same path policy and a JIT'd exit the same veto as an
+// image-based one. Sites beyond the ±128MB B/BL range of the trampoline go
+// through a one-instruction relay page (a bare `b trampoline`, preserving lr)
+// placed within range of both ends; pools farther than two hops are skipped
+// (fail-soft, same convention as image far-sites). MAP_JIT pages write via
+// pthread_jit_write_protect_np; plain anonymous exec pages take the same
+// vm_protect dance as image __TEXT. Idempotent: patched sites read as bl.
+
+static _Atomic BOOL shdw_svc_pools_enabled = NO;
+static void (*shdw_svc_jit_wp)(int) = NULL;
+
+#define SHDW_SVC_RELAY_MAX_PAGES 32
+#define SHDW_SVC_RELAY_SLOTS_PER_PAGE (vm_page_size / 4)
+
+static vm_address_t shdw_svc_relay_pages[SHDW_SVC_RELAY_MAX_PAGES];
+static size_t shdw_svc_relay_page_count = 0;
+static size_t shdw_svc_relay_slots_used[SHDW_SVC_RELAY_MAX_PAGES];
+static pthread_mutex_t shdw_svc_relay_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static BOOL shdw_svc_in_range(uintptr_t a, uintptr_t b) {
+    int64_t d = (int64_t)a - (int64_t)b;
+    return d >= -0x7FF0000LL && d <= 0x7FF0000LL;
+}
+
+// One 4-byte slot holding `b shdw_svc_trampoline_80`, within BL range of the
+// pool site. The site's bl lands here with lr = site+4; the relay's b keeps lr
+// intact, so the trampoline's ret lands back at site+4.
+static uintptr_t shdw_svc_pool_relay_for(uintptr_t site) {
+    uintptr_t tramp = (uintptr_t)shdw_svc_trampoline_80;
+
+    pthread_mutex_lock(&shdw_svc_relay_lock);
+
+    uintptr_t slot = 0;
+
+    // Existing pages first: reuse a slot if the page sits in range of both ends.
+    for(size_t p = 0; p < shdw_svc_relay_page_count && !slot; p++) {
+        vm_address_t base = shdw_svc_relay_pages[p];
+        if(shdw_svc_relay_slots_used[p] >= SHDW_SVC_RELAY_SLOTS_PER_PAGE) {
+            continue;
+        }
+        if(!shdw_svc_in_range(base, site) || !shdw_svc_in_range(base, tramp)) {
+            continue;
+        }
+        slot = base + shdw_svc_relay_slots_used[p] * 4;
+        shdw_svc_relay_slots_used[p]++;
+    }
+
+    if(!slot && shdw_svc_relay_page_count < SHDW_SVC_RELAY_MAX_PAGES) {
+        // A new page must land within range of both ends: the midpoint covers
+        // any separation up to two branch ranges; probe hints around it.
+        int64_t mid = ((int64_t)site + (int64_t)tramp) / 2;
+        int64_t candidates[5] = {
+            mid,
+            mid - 0x2000000LL,
+            mid + 0x2000000LL,
+            (int64_t)site + ((tramp > site) ? 0x4000000LL : -0x4000000LL),
+            (int64_t)tramp + ((site > tramp) ? 0x4000000LL : -0x4000000LL),
+        };
+
+        vm_address_t page = 0;
+
+        for(int c = 0; c < 5 && !page; c++) {
+            vm_address_t hint = (vm_address_t)(candidates[c] & ~(int64_t)(vm_page_size - 1));
+
+            if(!shdw_svc_in_range(hint, site) || !shdw_svc_in_range(hint, tramp)) {
+                continue;
+            }
+
+            vm_address_t addr = hint;
+            kern_return_t kr = vm_allocate(mach_task_self(), &addr, vm_page_size, VM_FLAGS_ANYWHERE);
+
+            if(kr != KERN_SUCCESS) {
+                continue;
+            }
+
+            if(shdw_svc_in_range(addr, site) && shdw_svc_in_range(addr, tramp)) {
+                page = addr;
+            } else {
+                vm_deallocate(mach_task_self(), addr, vm_page_size);
+            }
+        }
+
+        if(page) {
+            size_t idx = shdw_svc_relay_page_count++;
+            shdw_svc_relay_pages[idx] = page;
+            shdw_svc_relay_slots_used[idx] = 1;
+            slot = page;
+        }
+    }
+
+    pthread_mutex_unlock(&shdw_svc_relay_lock);
+
+    if(!slot) {
+        return 0;
+    }
+
+    // Emit the relay (bare jump to the trampoline) and make it stick RX.
+    int64_t delta = (int64_t)tramp - (int64_t)slot;
+    uint32_t insn = 0x14000000 | ((uint32_t)(delta >> 2) & 0x3FFFFFF);
+    vm_address_t page_addr = slot & ~(vm_address_t)(vm_page_size - 1);
+
+    if(vm_protect(mach_task_self(), page_addr, vm_page_size, FALSE,
+                  VM_PROT_READ | VM_PROT_WRITE) == KERN_SUCCESS) {
+        *(volatile uint32_t*)slot = insn;
+        vm_protect(mach_task_self(), page_addr, vm_page_size, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE);
+        sys_icache_invalidate((void*)slot, 4);
+    }
+
+    if(*(volatile uint32_t*)slot != insn) {
+        return 0;
+    }
+
+    return slot;
+}
+
+static BOOL shdw_svc_pool_write32(uintptr_t addr, uint32_t value) {
+    // MAP_JIT regions ignore vm_protect writes; they toggle writable for the
+    // calling thread only. Try that first, then the image-style protect dance
+    // for plain anonymous exec pages. Read-back verifies whichever worked.
+    if(shdw_svc_jit_wp) {
+        shdw_svc_jit_wp(0);
+        *(volatile uint32_t*)addr = value;
+        shdw_svc_jit_wp(1);
+        sys_icache_invalidate((void*)addr, 4);
+
+        if(*(volatile uint32_t*)addr == value) {
+            return YES;
+        }
+    }
+
+    vm_address_t page = addr & ~(vm_address_t)(vm_page_size - 1);
+
+    if(vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS
+       || vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+                     VM_PROT_READ | VM_PROT_WRITE) == KERN_SUCCESS) {
+        *(volatile uint32_t*)addr = value;
+        vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE);
+        sys_icache_invalidate((void*)addr, 4);
+
+        if(*(volatile uint32_t*)addr == value) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static void shdw_svc_patch_pool_region(vm_address_t start, vm_size_t size) {
+    const uint32_t* words = (const uint32_t*)start;
+    size_t nwords = size / 4;
+
+    size_t* sites = NULL;
+    size_t nsites = 0, capacity = 0;
+
+    for(size_t w = 0; w < nwords; w++) {
+        if(shdw_svc_is_instruction(words[w])) {
+            if(nsites == capacity) {
+                size_t grown = capacity ? capacity * 2 : 64;
+                size_t* resized = realloc(sites, grown * sizeof(*sites));
+
+                if(!resized) {
+                    free(sites);
+                    return;
+                }
+
+                sites = resized;
+                capacity = grown;
+            }
+
+            sites[nsites++] = w;
+        }
+    }
+
+    if(!nsites) {
+        free(sites);
+        return;
+    }
+
+    pthread_mutex_lock(&shdw_svc_patch_lock);
+
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t thread_count = 0;
+    mach_port_t current = MACH_PORT_NULL;
+
+    if(!shdw_svc_suspend_others(&threads, &thread_count, &current)) {
+        pthread_mutex_unlock(&shdw_svc_patch_lock);
+        free(sites);
+        return;
+    }
+
+    for(size_t s = 0; s < nsites; s++) {
+        size_t w = sites[s];
+        uintptr_t site = start + w * 4;
+        uint32_t insn = *(volatile uint32_t*)site;
+
+        if(!shdw_svc_is_instruction(insn)) {
+            continue;  // raced with another patcher or the JIT itself
+        }
+
+        // Same ptrace carve-out as the image scanner: never redirect a
+        // constant-x16 deny-attach site.
+        if(shdw_svc_site_const_sysno(words, nwords, w) == SYS_ptrace) {
+            continue;
+        }
+
+        uintptr_t target = (uintptr_t)shdw_svc_trampoline_80;
+
+        if(!shdw_svc_in_range(site, target)) {
+            target = shdw_svc_pool_relay_for(site);
+
+            if(!target) {
+                continue;
+            }
+        }
+
+        int64_t delta = (int64_t)target - (int64_t)site;
+        uint32_t bl = 0x94000000 | ((uint32_t)(delta >> 2) & 0x3FFFFFF);
+
+        shdw_svc_pool_write32(site, bl);
+    }
+
+    shdw_svc_resume_others(threads, thread_count, current);
+    shdw_svc_dispose_thread_list(threads, thread_count, current);
+    pthread_mutex_unlock(&shdw_svc_patch_lock);
+    free(sites);
+}
+
+// Sorted __TEXT range table of all loaded images, rebuilt per sweep: a pool
+// address inside an image is that image's site, handled by the image scanner.
+struct shdw_svc_text_range { uintptr_t lo, hi; };
+
+static int shdw_svc_range_cmp(const void* a, const void* b) {
+    uintptr_t la = ((const struct shdw_svc_text_range*)a)->lo;
+    uintptr_t lb = ((const struct shdw_svc_text_range*)b)->lo;
+    return la < lb ? -1 : la > lb ? 1 : 0;
+}
+
+static BOOL shdw_svc_pool_addr_in_image(uintptr_t addr,
+                                        const struct shdw_svc_text_range* ranges, size_t count) {
+    size_t lo = 0, hi = count;
+
+    while(lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if(addr < ranges[mid].lo) {
+            hi = mid;
+        } else if(addr >= ranges[mid].hi) {
+            lo = mid + 1;
+        } else {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+static BOOL shdw_svc_pool_is_relay(vm_address_t addr) {
+    for(size_t p = 0; p < shdw_svc_relay_page_count; p++) {
+        if(addr >= shdw_svc_relay_pages[p]
+           && addr < shdw_svc_relay_pages[p] + vm_page_size) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+// Sweeps every anonymous private executable region outside any loaded image.
+// Callable any time; safe to repeat (patched sites never re-match).
+void shdw_svc_patch_pools(void) {
+    if(!atomic_load_explicit(&shdw_svc_pools_enabled, memory_order_acquire)) {
+        return;
+    }
+
+    uint32_t image_count = _dyld_image_count();
+    struct shdw_svc_text_range* ranges = malloc((image_count ? image_count : 1) * sizeof(*ranges));
+
+    if(!ranges) {
+        return;
+    }
+
+    size_t nranges = 0;
+
+    for(uint32_t i = 0; i < image_count; i++) {
+        const struct mach_header_64* mh =
+            (const struct mach_header_64*)_dyld_get_image_header(i);
+
+        if(!mh || mh->magic != MH_MAGIC_64) {
+            continue;
+        }
+
+        const struct load_command* lc = (const struct load_command*)(mh + 1);
+
+        for(uint32_t c = 0; c < mh->ncmds; c++) {
+            if(lc->cmd == LC_SEGMENT_64
+               && strcmp(((const struct segment_command_64*)lc)->segname, "__TEXT") == 0) {
+                const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+                intptr_t slide = (intptr_t)((uintptr_t)mh - (uintptr_t)seg->vmaddr);
+
+                ranges[nranges].lo = (uintptr_t)seg->vmaddr + slide;
+                ranges[nranges].hi = ranges[nranges].lo + seg->vmsize;
+                nranges++;
+                break;
+            }
+
+            lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+        }
+    }
+
+    qsort(ranges, nranges, sizeof(*ranges), shdw_svc_range_cmp);
+
+    vm_address_t addr = 0;
+
+    while(addr < 0x300000000ULL) {
+        vm_size_t size = 0;
+        vm_region_extended_info_data_t info;
+        mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT;
+        mach_port_t object = MACH_PORT_NULL;
+
+        kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size,
+                                        VM_REGION_EXTENDED_INFO,
+                                        (vm_region_info_t)&info, &count, &object);
+        shdw_svc_dispose_object(&object);
+
+        if(kr != KERN_SUCCESS || size == 0) {
+            break;
+        }
+
+        BOOL exec = (info.protection & VM_PROT_EXECUTE) != 0;
+        BOOL private_map = info.share_mode == SM_PRIVATE;
+
+        if(exec && private_map && size < (64u << 20)
+           && !shdw_svc_pool_is_relay(addr)
+           && !shdw_svc_pool_addr_in_image(addr, ranges, nranges)) {
+            shdw_svc_patch_pool_region(addr, size);
+        }
+
+        addr += size;
+    }
+
+    free(ranges);
+}
+
+static _Atomic BOOL shdw_svc_pool_timer_started = NO;
+
+static void shdw_svc_pool_timer_fire(void* unused) {
+    (void)unused;
+    shdw_svc_patch_pools();
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+                     dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, shdw_svc_pool_timer_fire);
+}
+
+static void shdw_svc_pool_timer_start_once(void) {
+    if(atomic_exchange_explicit(&shdw_svc_pool_timer_started, YES, memory_order_acq_rel)) {
+        return;
+    }
+
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+                     dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, shdw_svc_pool_timer_fire);
+}
+
 // Add-image callback: resolve the image path (the callback only carries the
 // header), apply the skip rule, scan. Registered through the REAL dyld
 // registration (the dyld.x hook passes Shadow-internal callers through), so
@@ -811,9 +1181,10 @@ static const struct mach_header* shdw_svc_own_image = NULL;
 // install): inline scan on add instead of the async queue.
 static _Atomic BOOL shdw_svc_sync_mode = NO;
 
-void shdw_svc_patch_configure(BOOL sync, BOOL exitVeto) {
+void shdw_svc_patch_configure(BOOL sync, BOOL exitVeto, BOOL pools) {
     atomic_store_explicit(&shdw_svc_sync_mode, sync, memory_order_release);
     atomic_store_explicit(&shdw_svc_exit_veto, exitVeto, memory_order_release);
+    atomic_store_explicit(&shdw_svc_pools_enabled, pools, memory_order_release);
 }
 
 static pthread_mutex_t shdw_svc_queue_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -952,6 +1323,16 @@ void shdw_svc_patch_install(void) {
     shdw_svc_own_image = (const struct mach_header*)info.dli_fbase;
     installed = YES;
     _dyld_register_func_for_add_image(shdw_svc_image_add);
+
+    if(atomic_load_explicit(&shdw_svc_pools_enabled, memory_order_acquire)) {
+        if(!shdw_svc_jit_wp) {
+            shdw_svc_jit_wp = (void (*)(int))dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+        }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            shdw_svc_patch_pools();
+        });
+        shdw_svc_pool_timer_start_once();
+    }
 }
 
 #else   // !__arm64__
@@ -962,6 +1343,9 @@ void shdw_svc_patch_install(void) {
 }
 
 void shdw_svc_patch_deferred(void) {
+}
+
+void shdw_svc_patch_pools(void) {
 }
 
 #endif  // __arm64__

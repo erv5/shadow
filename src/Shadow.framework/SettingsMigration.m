@@ -33,6 +33,10 @@ NSDictionary<NSString*, id>* SHDWMigratedHookSettings(NSDictionary<NSString*, id
             SHDWUniversalSvcSyncID,
             // Per-app termination-syscall veto (same reader).
             SHDWUniversalSvcExitVetoID,
+            // Per-app JIT-pool svc coverage (same reader).
+            SHDWUniversalSvcPoolsID,
+            // Per-app deferred tweak loads (same reader).
+            SHDWUniversalDeferredLoadID,
         ]];
         // Per-plugin hook toggles are live again (per-app override surface). The
         // planner gates each plugin on prefs[prefKey], so these keys must survive

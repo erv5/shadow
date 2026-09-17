@@ -59,6 +59,7 @@ static inline int shdw_is_trusted_loader_image(const char* path) {
         "/libellekit.dylib",
         "/libroot.dylib",
         "Choicy.dylib",     // the installed filename may carry leading spaces
+        "/00DeferredRst.dylib",  // deferred-tweak loader shim (post-init dlopen)
         NULL,
     };
 
