@@ -15,3 +15,19 @@
     "FOLLOW_GLOBAL" = "跟隨全域設定";
     "APP_USES_GLOBAL" = "正在跟隨全域設定。關閉以自訂此應用程式。";
 
+"HOOK_TOGGLES" = "鉤子開關";
+"APP_HOOKS_DESC" = "進階：為此應用程式啟用或停用個別鉤子類別。預設值遵循全域配置。停用某個類別可能會讓對應的偵測方法通過；啟用易當機的類別可能會使應用程式不穩定。";
+"HOOK_FILESYSTEM" = "檔案系統";
+"HOOK_DYNLIB" = "動態函式庫";
+"HOOK_ENVVARS" = "環境變數";
+"HOOK_FOUNDATION" = "Foundation 框架";
+"HOOK_MACHBOOTSTRAP" = "Mach 服務查詢";
+"HOOK_IOKIT" = "IOKit";
+"HOOK_LOWLEVELC" = "底層檔案控制代碼";
+"HOOK_ANTIDEBUG" = "反偵錯方法";
+"HOOK_CODESIGNING" = "程式碼簽章";
+"HOOK_SYSCALL" = "私有系統呼叫";
+"HOOK_MEMORY" = "記憶體";
+"HOOK_SANDBOX" = "App 沙盒";
+"HOOK_HIDEAPPS" = "App 列舉";
+"HOOK_URLSCHEME" = "URL 處理常式";

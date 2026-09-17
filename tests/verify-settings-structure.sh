@@ -38,18 +38,18 @@ if grep -Eq 'respring:|reset:|exportSettings:|importSettings:|DetectorLog' "$roo
 fi
 
 # The app pane is a single Follow Global toggle plus the two settings it
-# governs (App_Enabled and Detector_Aggressive): three switches, no revived
-# per-hook or profile controls, and no App_Disabled (the single-toggle backend
-# never writes it). Aggressive mode has no separate follow-global toggle — it
-# follows the one App_FollowGlobal. Universal_/Adapter_ per-hook keys must never
-# reappear as UI; Detector_Aggressive is the one allowed detector-mode key.
-if [ "$(grep -c '<string>PSSwitchCell</string>' "$app")" -ne 3 ] ||
+# governs (App_Enabled and Detector_Aggressive), followed by the per-hook
+# customization set (14 Universal_ switches, hidden while following global;
+# 28d81d7). Seventeen switches total, no App_Disabled (the single-toggle
+# backend never writes it), no revived profile controls, and no Adapter_
+# keys as UI.
+if [ "$(grep -c '<string>PSSwitchCell</string>' "$app")" -ne 17 ] ||
    ! grep -q '<string>App_Enabled</string>' "$app" ||
    ! grep -q '<string>App_FollowGlobal</string>' "$app" ||
    ! grep -q '<string>Detector_Aggressive</string>' "$app" ||
    grep -q '<string>App_AggressiveFollowGlobal</string>' "$app" ||
-   grep -Eq 'App_Disabled|BypassPreset|Universal_|Adapter_' "$app"; then
-    echo 'SETTINGS DRIFT: app pane is not the single follow-global toggle plus App_Enabled and Detector_Aggressive'
+   grep -Eq 'App_Disabled|BypassPreset|Adapter_' "$app"; then
+    echo 'SETTINGS DRIFT: app pane lost the follow-global toggle, core switches, or per-hook customization set'
     exit 1
 fi
 
@@ -131,6 +131,12 @@ specifier_ids = {
 full = [
     "AppSettingsGroup", "App_FollowGlobal", "App_Enabled",
     "AppAggressiveGroup", "Detector_Aggressive",
+    "AppHooksGroup",
+    "Universal_Filesystem", "Universal_DynamicLibrariesExtra",
+    "Universal_EnvVars", "Universal_Foundation", "Universal_MachBootstrap",
+    "Universal_IOKit", "Universal_LowLevelC", "Universal_AntiDebugging",
+    "Universal_CodeSigning", "Universal_Syscall", "Universal_Memory",
+    "Universal_Sandbox", "Universal_HideApps", "Universal_URLScheme",
     "AppResetGroup", "AppReset",
 ]
 assert plist_ids == full, "App.plist specifier order changed"
@@ -150,7 +156,16 @@ def apply(specifiers, calls):
     return specifiers
 
 
-following = ["AppSettingsGroup", "App_FollowGlobal", "AppResetGroup", "AppReset"]
+following = [
+    "AppSettingsGroup", "App_FollowGlobal",
+    "AppHooksGroup",
+    "Universal_Filesystem", "Universal_DynamicLibrariesExtra",
+    "Universal_EnvVars", "Universal_Foundation", "Universal_MachBootstrap",
+    "Universal_IOKit", "Universal_LowLevelC", "Universal_AntiDebugging",
+    "Universal_CodeSigning", "Universal_Syscall", "Universal_Memory",
+    "Universal_Sandbox", "Universal_HideApps", "Universal_URLScheme",
+    "AppResetGroup", "AppReset",
+]
 assert apply(full, initial_ops) == following
 for _ in range(2):
     assert apply(full, on_ops) == following

@@ -383,6 +383,17 @@ void shdw_svc_patch_install(void);
 // debounce drains it. Safe from any thread, idempotent.
 void shdw_svc_patch_deferred(void);
 
+// Per-app svc policy (Universal_SvcSync / Universal_SvcExitVeto prefs, read
+// once at ShadowCore init). Sync: every added image is scanned inline in
+// dyld's add-image callback instead of queued for the async drainer, so a
+// detector's svc sites are intercepted before its initializers can probe.
+// ExitVeto: raw termination syscalls (SYS_exit, kill(self, fatal)) from
+// app-owned sites are swallowed with faked kernel-success, so a RASP error
+// flow cannot kill the process through them. Both cost something (launch
+// time / broken legitimate self-termination); intended for BShield-class
+// detectors that probe and self-terminate during the async window.
+void shdw_svc_patch_configure(BOOL sync, BOOL exitVeto);
+
 // YES when the return address lies inside the Security.framework image.
 // Used by the csops policy: Security constructs its own code-identity views
 // (SecCodeCopySelf) by reading the CDHASH through csops — blinding THOSE

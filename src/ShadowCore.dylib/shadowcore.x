@@ -251,6 +251,8 @@ static void shdw_coordinator_ctor(NSDictionary<NSString*, id>* prefs) {
         // Capture authorization independently of current target readiness.
         shdw_adapter_devicecheck_configure(prefs);
         prefs = shdw_adapter_resolve_preferences(prefs);
+        shdw_svc_patch_configure([prefs[SHDWUniversalSvcSyncID] boolValue],
+                                 [prefs[SHDWUniversalSvcExitVetoID] boolValue]);
         BOOL hasActiveDetectorAdapter = NO;
         for(NSString* key in @[ SHDWAdapterDTTJailbreakDetectionID, SHDWAdapterSafeDeviceID,
                                 SHDWAdapterJailMonkeyID ]) {

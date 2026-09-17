@@ -58,6 +58,11 @@ static void *worker(void *unused) {
     shdw_env_snapshot_filtered = malloc(8);
     shdw_env_snapshot_path = malloc(8);
     shdw_env_procargs_path = malloc(8);
+    // Host check: macOS 24+ tears down _Thread_local storage before pthread
+    // key destructors run, so a real thread exit cannot exercise the cleanup
+    // here (the destructor would see zeroed slots). Drive it explicitly; on
+    // the iOS target pthread runs key destructors while tlv is still live.
+    shdw_env_tls_destructor(NULL);
     return NULL;
 }
 int main(int argc, char **argv) {

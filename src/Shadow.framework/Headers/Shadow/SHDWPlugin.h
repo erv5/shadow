@@ -61,6 +61,22 @@
 // a named detector. Only meaningful when the app is enabled.
 #define SHDWDetectorAggressiveID   @"Detector_Aggressive"
 
+// Per-app svc-scan policy. When on for an app, ShadowCore scans every added
+// image for inline svc sites synchronously in dyld's add-image callback
+// instead of queueing for the async drainer, so a detector's raw-svc probes
+// are intercepted before its initializers can run. Costs launch time on
+// image-heavy apps; intended for detectors that probe during the async window
+// (BShield-class). Per-app only: read from the app dict by ShadowCore at init.
+#define SHDWUniversalSvcSyncID     @"Universal_SvcSync"
+
+// Per-app termination veto. When on for an app, raw termination syscalls
+// (SYS_exit; kill(self, SIGKILL/SIGTERM/SIGABRT/SIGQUIT)) issued from
+// app-owned svc sites are swallowed with the kernel-success convention faked,
+// so a RASP error flow cannot terminate the process through them. Force-quit
+// and jetsam still work (they never pass through these sites). Per-app only:
+// read from the app dict by ShadowCore at init.
+#define SHDWUniversalSvcExitVetoID @"Universal_SvcExitVeto"
+
 // Resolve the effective aggressive-neutralization state for an app: the per-app
 // override if present, else the global default. Mirrors SHDWApplicationEnabled's
 // global-fallback shape.

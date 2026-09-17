@@ -47,3 +47,4 @@
 "BACKUP_RESTORE_DESC" = "将 Shadow 与 Choicy 配置导出到文件，或在另一台设备上恢复。";
 "EXPORT_CONFIG" = "导出配置";
 "IMPORT_CONFIG" = "导入配置";
+"ALERT_OK" = "OK";

@@ -38,3 +38,4 @@
 "BACKUP_RESTORE_DESC" = "صدّر إعدادات Shadow و Choicy إلى ملف أو استعدها على جهاز آخر.";
 "EXPORT_CONFIG" = "تصدير الإعدادات";
 "IMPORT_CONFIG" = "استيراد الإعدادات";
+"ALERT_OK" = "OK";

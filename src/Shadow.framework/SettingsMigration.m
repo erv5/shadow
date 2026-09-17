@@ -29,6 +29,10 @@ NSDictionary<NSString*, id>* SHDWMigratedHookSettings(NSDictionary<NSString*, id
             // Live at both scopes: the global default (root scalar) and the
             // per-app override (same key inside an app dict).
             SHDWDetectorAggressiveID,
+            // Per-app svc-scan policy (read by ShadowCore, not the planner).
+            SHDWUniversalSvcSyncID,
+            // Per-app termination-syscall veto (same reader).
+            SHDWUniversalSvcExitVetoID,
         ]];
         // Per-plugin hook toggles are live again (per-app override surface). The
         // planner gates each plugin on prefs[prefKey], so these keys must survive

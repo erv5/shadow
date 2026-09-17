@@ -23,6 +23,7 @@
 
 #import <libkern/OSCacheControl.h>
 #import <pthread.h>
+#import <signal.h>
 #import <stdlib.h>
 #import <sys/event.h>
 #import <sys/syscall.h>
@@ -63,6 +64,16 @@ static BOOL shdw_svc_rewriteable(int sysno, uint64_t flags) {
 }
 
 // --- Trampoline helper ------------------------------------------------------
+// Helper return convention: 0 = allow (execute the original svc), positive =
+// errno to synthesize with carry set (ENOENT for the path shapes, ESRCH for
+// the kevent liveness shapes), SHDW_SVC_VETO = swallow the call and return
+// kernel-success with x0 = 0 (termination-syscall veto; the caller believes
+// exit/kill succeeded).
+#define SHDW_SVC_VETO (-1)
+
+// Universal_SvcExitVeto per-app pref (set once by shdw_svc_patch_configure).
+static _Atomic BOOL shdw_svc_exit_veto = NO;
+
 // Runs with the app's registers saved on the stack (see the trampoline
 // asm). A normal C function: may clobber x0-x18/lr freely, must preserve
 // x19-x28 (the compiler does). Returns 0 = allow (execute the original
@@ -71,6 +82,15 @@ static BOOL shdw_svc_rewriteable(int sysno, uint64_t flags) {
 // Plain C linkage (Logos emits ObjC .m, no mangling), so the inline-asm
 // `bl _shdw_svc_should_deny` resolves.
 __attribute__((used, noinline)) int shdw_svc_should_deny(uint64_t sysno, uint64_t a0, uint64_t a1, uint64_t a2, uintptr_t caller_lr) {
+    // The patched site is in app/detector code by construction (system and
+    // Shadow images are never scanned), but keep the same caller gate the
+    // libc hooks use — the return address is passed explicitly because
+    // isCallerExternal()'s builtin read would see the trampoline's own
+    // (ShadowCore) address.
+    if(!shdw_caller_is_external((const void*)caller_lr)) {
+        return 0;
+    }
+
     // The patched site is in app/detector code by construction (system and
     // Shadow images are never scanned), but keep the same caller gate the
     // libc hooks use — the return address is passed explicitly because
@@ -91,6 +111,20 @@ __attribute__((used, noinline)) int shdw_svc_should_deny(uint64_t sysno, uint64_
             return 0;
         }
         return shdw_svc_should_deny((uint64_t)real, a1, a2, 0, caller_lr);
+    }
+
+    // Exit veto (per-app Universal_SvcExitVeto): a raw termination syscall
+    // from app-owned code is swallowed, with the kernel-success convention
+    // faked — the RASP error flow believes the process terminated. Legitimate
+    // app quits still work (force-quit/jetsam never pass through these sites).
+    if(atomic_load_explicit(&shdw_svc_exit_veto, memory_order_acquire)) {
+        if((int)sysno == SYS_exit) {
+            return SHDW_SVC_VETO;
+        }
+        if((int)sysno == SYS_kill && (pid_t)a0 == getpid()
+           && ((int)a1 == SIGKILL || (int)a1 == SIGTERM || (int)a1 == SIGABRT || (int)a1 == SIGQUIT)) {
+            return SHDW_SVC_VETO;
+        }
     }
 
     shdw_raw_syscall_category_t cat = shdw_raw_syscall_category((int)sysno);
@@ -260,11 +294,20 @@ __attribute__((naked, used, noinline)) static void NAME(void) { \
         "ldr x4, [sp, #8]\n" \
         "bl _shdw_svc_should_deny\n" \
         "cbz x0, 1f\n" \
+        /* SHDW_SVC_VETO (int -1): swallow the call, fake kernel-success */ \
+        /* (carry clear, x0 = 0). Compare w0: the int return zero-extends. */ \
+        "cmn w0, #1\n" \
+        "b.eq 2f\n" \
         /* deny: x0 already holds the errno to synthesize (ENOENT for the */ \
         /* path shapes, ESRCH for kevent) — set carry (Darwin's kernel */ \
         /* error convention) and return, keeping x0 */ \
         "mov x1, #0x20000000\n" \
         "msr nzcv, x1\n" \
+        "b 3f\n" \
+        "2:\n" \
+        "msr nzcv, xzr\n" \
+        "mov x0, #0\n" \
+        "3:\n" \
         "ldp x18, lr, [sp], #16\n" \
         "ldp x16, x17, [sp], #16\n" \
         "ldp x14, x15, [sp], #16\n" \
@@ -764,6 +807,15 @@ static void shdw_svc_patch_image(const struct mach_header* mh, intptr_t slide, c
 
 static const struct mach_header* shdw_svc_own_image = NULL;
 
+// Universal_SvcSync per-app pref (set once by shdw_svc_patch_configure before
+// install): inline scan on add instead of the async queue.
+static _Atomic BOOL shdw_svc_sync_mode = NO;
+
+void shdw_svc_patch_configure(BOOL sync, BOOL exitVeto) {
+    atomic_store_explicit(&shdw_svc_sync_mode, sync, memory_order_release);
+    atomic_store_explicit(&shdw_svc_exit_veto, exitVeto, memory_order_release);
+}
+
 static pthread_mutex_t shdw_svc_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static const struct mach_header* shdw_svc_queue[SHDW_SVC_QUEUE_MAX];
 static intptr_t shdw_svc_queue_slide[SHDW_SVC_QUEUE_MAX];
@@ -833,6 +885,11 @@ static void shdw_svc_drain_async(void* unused) {
 
 static void shdw_svc_image_add(const struct mach_header* mh, intptr_t slide) {
     if(!shdw_svc_own_image || mh == shdw_svc_own_image) {
+        return;
+    }
+
+    if(atomic_load_explicit(&shdw_svc_sync_mode, memory_order_acquire)) {
+        shdw_svc_patch_header(mh, slide);
         return;
     }
 

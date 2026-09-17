@@ -186,9 +186,10 @@
 }
 
 - (void)shdwShowAlert:(NSString *)title message:(NSString *)message {
+	NSBundle* bundle = [NSBundle bundleForClass:[self class]];
 	UIAlertController* alert = [UIAlertController alertControllerWithTitle:title
 		message:message preferredStyle:UIAlertControllerStyleAlert];
-	[alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+	[alert addAction:[UIAlertAction actionWithTitle:[bundle localizedStringForKey:@"ALERT_OK" value:@"Ok" table:@"Root"] style:UIAlertActionStyleDefault handler:nil]];
 	[self presentViewController:alert animated:YES completion:nil];
 }
 @end

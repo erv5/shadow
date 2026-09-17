@@ -1547,7 +1547,10 @@ void shdw_universal_syscall(SHDWHookSession* hooks) {
             withReplacement:(void*)&shdw_env_published_array
                    outOldPtr:NULL];
 
-    // Raw svc #0x80 interception (svc_patch.x): loaded-image writes are
-    // serialized and stop-the-world before app code can execute them.
+    // Raw svc #0x80 interception (svc_patch.x): added images are queued and
+    // scanned by a debounced utility-queue drainer off dyld's load path (the
+    // batch cap bounds exposure during dlopen storms); with the per-app
+    // Universal_SvcSync pref every image is scanned inline in the add-image
+    // callback instead.
     shdw_svc_patch_install();
 }

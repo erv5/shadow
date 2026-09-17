@@ -33,12 +33,18 @@ bundle_start = skip.index("if([imagePath isEqualToString:bundlePath]")
 bundle_end = skip.index("// dyld reports", bundle_start)
 assert "return NO;" in skip[bundle_start:bundle_end]
 
-# Identity exclusion precedes any queue/patch work, and images queue (not
-# patch) on the add path — the drainer does the scanning off the load path.
+# Identity exclusion precedes any queue/patch work. The default add path
+# queues (the drainer scans off the load path); the Universal_SvcSync gate is
+# the only inline scan, and it returns before any queue work; the queue-full
+# fallback still patches inline, only after the append attempt.
 assert callback.index("if(!shdw_svc_own_image || mh == shdw_svc_own_image)") < callback.index(
     "pthread_mutex_lock(&shdw_svc_queue_lock)"
 )
-assert callback.index("shdw_svc_queue_count++") < callback.index("shdw_svc_patch_header(mh, slide)")
+assert callback.index("atomic_load_explicit(&shdw_svc_sync_mode") < callback.index(
+    "pthread_mutex_lock(&shdw_svc_queue_lock)"
+)
+fallback = callback[callback.index("if(!queued)"):]
+assert "shdw_svc_patch_header(mh, slide)" in fallback
 
 # The drain takes the queue lock and empties the queue before scanning.
 assert deferred.index("pthread_mutex_lock(&shdw_svc_queue_lock)") < deferred.index(
@@ -75,6 +81,7 @@ typedef struct { const char *dli_fname; void *dli_fbase; } Dl_info;
 #define SHDW_SVC_QUEUE_MAX 1024
 
 static const struct mach_header *shdw_svc_own_image = NULL;
+static _Atomic BOOL shdw_svc_sync_mode = NO;
 static pthread_mutex_t shdw_svc_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static const struct mach_header *shdw_svc_queue[SHDW_SVC_QUEUE_MAX];
 static intptr_t shdw_svc_queue_slide[SHDW_SVC_QUEUE_MAX];
@@ -197,6 +204,23 @@ int main(void) {
     /* An empty drain is a no-op. */
     shdw_svc_patch_deferred();
     assert(patches == 2);
+
+    /* Universal_SvcSync: images scan inline on the add path, nothing queues. */
+    shdw_svc_sync_mode = YES;
+    set_image(&app_header, "/bundle/Sync.framework/Sync");
+    shdw_svc_image_add(&app_header, 0);
+    assert(patches == 3);
+    assert(last_patched == &app_header);
+    assert(shdw_svc_queue_count == 0);
+    shdw_svc_sync_mode = NO;
+
+    /* Queueing resumes once sync mode is off. */
+    set_image(&app_header2, "/bundle/Async.framework/Async");
+    shdw_svc_image_add(&app_header2, 0);
+    assert(patches == 3);
+    assert(shdw_svc_queue_count == 1);
+    shdw_svc_patch_deferred();
+    assert(patches == 4);
 
     puts("verify-svc-self-image: scanner admission assertions passed");
     return 0;

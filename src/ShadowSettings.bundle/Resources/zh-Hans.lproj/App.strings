@@ -17,3 +17,19 @@
 "FOLLOW_GLOBAL" = "跟随全局设置";
 "APP_USES_GLOBAL" = "正在跟随全局设置。关闭以自定义此应用。";
 
+"HOOK_TOGGLES" = "钩子开关";
+"APP_HOOKS_DESC" = "高级：为此应用启用或禁用各个钩子类别。默认值遵循全局配置。禁用某个类别可能会让对应的检测方法通过；启用易崩溃的类别可能会使应用不稳定。";
+"HOOK_FILESYSTEM" = "文件系统";
+"HOOK_DYNLIB" = "动态库";
+"HOOK_ENVVARS" = "环境变量";
+"HOOK_FOUNDATION" = "Foundation 框架";
+"HOOK_MACHBOOTSTRAP" = "Mach 服务查询";
+"HOOK_IOKIT" = "IOKit";
+"HOOK_LOWLEVELC" = "底层文件句柄";
+"HOOK_ANTIDEBUG" = "反调试方法";
+"HOOK_CODESIGNING" = "代码签名";
+"HOOK_SYSCALL" = "私有系统调用";
+"HOOK_MEMORY" = "内存";
+"HOOK_SANDBOX" = "应用沙盒";
+"HOOK_HIDEAPPS" = "应用枚举";
+"HOOK_URLSCHEME" = "URL 处理程序";
