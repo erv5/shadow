@@ -1148,6 +1148,13 @@ static void shdw_svc_pool_timer_fire(void* unused) {
                      dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, shdw_svc_pool_timer_fire);
 }
 
+// One-shot sweep used by the add-image path (a new image often means a new
+// JIT pool moments later); the repeating timer keeps its own cadence.
+static void shdw_svc_pool_timer_fire_once(void* unused) {
+    (void)unused;
+    shdw_svc_patch_pools();
+}
+
 static void shdw_svc_pool_timer_start_once(void) {
     if(atomic_exchange_explicit(&shdw_svc_pool_timer_started, YES, memory_order_acq_rel)) {
         return;
@@ -1257,6 +1264,15 @@ static void shdw_svc_drain_async(void* unused) {
 static void shdw_svc_image_add(const struct mach_header* mh, intptr_t slide) {
     if(!shdw_svc_own_image || mh == shdw_svc_own_image) {
         return;
+    }
+
+    // A freshly dlopened image (a deferred tweak, a lazy framework) often
+    // brings a brand-new JIT pool moments later; re-sweep pools right behind
+    // it so a detector's exit stub never gets a full timer-tick to fire in.
+    if(atomic_load_explicit(&shdw_svc_pools_enabled, memory_order_acquire)) {
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 200LL * NSEC_PER_MSEC),
+                         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL,
+                         shdw_svc_pool_timer_fire_once);
     }
 
     if(atomic_load_explicit(&shdw_svc_sync_mode, memory_order_acquire)) {
