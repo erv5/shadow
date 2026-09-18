@@ -38,6 +38,10 @@ NSDictionary<NSString*, id>* SHDWMigratedHookSettings(NSDictionary<NSString*, id
             // Per-app deferred tweak loads (same reader).
             SHDWUniversalDeferredLoadID,
         ]];
+        // Every key the default settings define is live somewhere (planner or
+        // a direct reader like shadowcore's HK_Library backend pin); none may
+        // be pruned merely for lacking a plugin entry.
+        [keys addObjectsFromArray:[SHDWDefaultHookSettings() allKeys]];
         // Per-plugin hook toggles are live again (per-app override surface). The
         // planner gates each plugin on prefs[prefKey], so these keys must survive
         // migration instead of being pruned as phantom switches.
